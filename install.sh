@@ -4,6 +4,10 @@ set -Eeuo pipefail
 umask 077
 
 readonly SING_BOX_VERSION="1.13.19"
+readonly CLOUDFLARED_VERSION="2026.8.2"
+readonly CLOUDFLARED_RELEASE_TAG="cloudflared-${CLOUDFLARED_VERSION}-s390x"
+readonly CLOUDFLARED_RELEASE_BASE="https://github.com/zhu748/ibmfree/releases/download/${CLOUDFLARED_RELEASE_TAG}"
+readonly CLOUDFLARED_INSTALL_PATH="/usr/local/bin/cloudflared"
 readonly SERVICE_NAME="edge-router"
 readonly TUNNEL_SERVICE_NAME="edge-tunnel"
 readonly CONFIG_DIR="/etc/edge-router"
@@ -26,10 +30,10 @@ COLOR_CYAN='\033[0;36m'
 COLOR_RESET='\033[0m'
 
 PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
-DEPLOY_MODE="${DEPLOY_MODE:-}"
+DEPLOY_MODE="${DEPLOY_MODE:-tunnel}"
 CUSTOM_UUID="${UUID:-}"
 WS_PATH="${WS_PATH:-}"
-ORIGIN_PORT="${ORIGIN_PORT:-18080}"
+ORIGIN_PORT="${ORIGIN_PORT:-8001}"
 SING_BOX_PORT="${SING_BOX_PORT:-}"
 TLS_CERT_FILE="${TLS_CERT_FILE:-}"
 TLS_KEY_FILE="${TLS_KEY_FILE:-}"
@@ -242,6 +246,50 @@ download_file() {
     --output "$output" "$url"
 }
 
+install_cloudflared_s390x() {
+  local binary checksum checksum_name expected_hash actual_hash
+
+  [[ $(uname -m) == "s390x" || $(uname -m) == "s390" ]] || \
+    die "当前架构没有自动 cloudflared 安装包，请通过 CLOUDFLARED_BIN 指定可执行文件。"
+
+  TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+  binary="${TEMP_DIR}/cloudflared-linux-s390x"
+  checksum="${TEMP_DIR}/cloudflared-linux-s390x.sha256"
+
+  info "下载 cloudflared ${CLOUDFLARED_VERSION} s390x 发布包……"
+  download_file "${CLOUDFLARED_RELEASE_BASE}/cloudflared-linux-s390x" "$binary"
+  download_file "${CLOUDFLARED_RELEASE_BASE}/cloudflared-linux-s390x.sha256" "$checksum"
+
+  expected_hash=$(awk 'NR == 1 { print $1 }' "$checksum")
+  checksum_name=$(awk 'NR == 1 { name=$2; sub(/^\*/, "", name); print name }' "$checksum")
+  [[ $expected_hash =~ ^[0-9a-fA-F]{64}$ ]] || die "cloudflared 校验文件格式无效。"
+  [[ $checksum_name == "cloudflared-linux-s390x" ]] || die "cloudflared 校验文件名无效。"
+  actual_hash=$(sha256_file "$binary")
+  [[ ${actual_hash,,} == "${expected_hash,,}" ]] || \
+    die "cloudflared 校验失败。期望 ${expected_hash}，实际 ${actual_hash}。"
+
+  install -d -o root -g root -m 0755 "$(dirname "$CLOUDFLARED_INSTALL_PATH")"
+  backup_file "$CLOUDFLARED_INSTALL_PATH"
+  install -o root -g root -m 0755 "$binary" "$CLOUDFLARED_INSTALL_PATH"
+  CLOUDFLARED_BIN=$CLOUDFLARED_INSTALL_PATH
+  success "cloudflared s390x 发布包校验并安装完成。"
+}
+
+ensure_cloudflared() {
+  if [[ -z "$CLOUDFLARED_BIN" ]]; then
+    CLOUDFLARED_BIN=$(command -v cloudflared || true)
+  fi
+
+  if [[ -z "$CLOUDFLARED_BIN" ]]; then
+    install_cloudflared_s390x
+  fi
+
+  [[ $CLOUDFLARED_BIN =~ ^/[A-Za-z0-9_./-]+$ ]] || die "cloudflared 路径包含不安全字符。"
+  [[ -x $CLOUDFLARED_BIN ]] || die "cloudflared 不存在或不可执行: ${CLOUDFLARED_BIN}"
+  "$CLOUDFLARED_BIN" tunnel run --help 2>&1 | grep -q -- '--token-file' || \
+    die "当前 cloudflared 版本不支持 --token-file，请升级。"
+}
+
 install_packages() {
   info "检查基础依赖……"
 
@@ -263,8 +311,47 @@ install_packages() {
   command -v ss >/dev/null 2>&1 || die "缺少 ss 命令（通常由 iproute2 提供）。"
 }
 
+read_json_string() {
+  local file=$1
+  local key=$2
+
+  grep -m1 -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" "$file" 2>/dev/null | \
+    sed -E 's/^[^:]+:[[:space:]]*"//; s/"$//' || true
+}
+
+read_json_number() {
+  local file=$1
+  local key=$2
+
+  grep -m1 -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" "$file" 2>/dev/null | \
+    sed -E 's/^[^:]+:[[:space:]]*//' || true
+}
+
 collect_configuration() {
-  local tunnel_token=""
+  local existing_path existing_port existing_uuid generated_uuid tunnel_token=""
+
+  if [[ -s $CONFIG_PATH ]]; then
+    existing_uuid=$(read_json_string "$CONFIG_PATH" uuid)
+    existing_path=$(read_json_string "$CONFIG_PATH" path)
+    existing_port=$(read_json_number "$CONFIG_PATH" listen_port)
+
+    if [[ -z "$WS_PATH" ]] && validate_ws_path "$existing_path"; then
+      WS_PATH=$existing_path
+    fi
+    if [[ -z "$SING_BOX_PORT" ]] && validate_port "$existing_port"; then
+      SING_BOX_PORT=$existing_port
+    fi
+  fi
+
+  if [[ -z "$CUSTOM_UUID" ]]; then
+    if validate_uuid "$existing_uuid"; then
+      generated_uuid=$existing_uuid
+    else
+      generated_uuid=$(generate_uuid)
+    fi
+    read_value CUSTOM_UUID "UUID（留空自动生成）" "$generated_uuid"
+  fi
+  validate_uuid "$CUSTOM_UUID" || die "UUID 格式无效。"
 
   read_value PUBLIC_DOMAIN "公网域名"
   validate_domain "$PUBLIC_DOMAIN" || die "公网域名格式无效。"
@@ -276,11 +363,6 @@ collect_configuration() {
   read_value DEPLOY_MODE "部署模式（tunnel/direct）" "tunnel"
   DEPLOY_MODE=${DEPLOY_MODE,,}
   [[ $DEPLOY_MODE == "tunnel" || $DEPLOY_MODE == "direct" ]] || die "部署模式只能是 tunnel 或 direct。"
-
-  if [[ -z "$CUSTOM_UUID" ]]; then
-    CUSTOM_UUID=$(generate_uuid)
-  fi
-  validate_uuid "$CUSTOM_UUID" || die "UUID 格式无效。"
 
   if [[ -z "$WS_PATH" ]]; then
     WS_PATH="/$(random_hex 12)/$(random_hex 16)"
@@ -300,13 +382,7 @@ collect_configuration() {
     [[ -s $TLS_CERT_FILE ]] || die "TLS 证书不存在或为空。"
     [[ -s $TLS_KEY_FILE ]] || die "TLS 私钥不存在或为空。"
   else
-    if [[ -z "$CLOUDFLARED_BIN" ]]; then
-      CLOUDFLARED_BIN=$(command -v cloudflared || true)
-    fi
-    [[ $CLOUDFLARED_BIN =~ ^/[A-Za-z0-9_./-]+$ ]] || die "cloudflared 路径包含不安全字符。"
-    [[ -x $CLOUDFLARED_BIN ]] || die "tunnel 模式需要 cloudflared。请先运行仓库的 s390x 构建工作流并安装产物。"
-    "$CLOUDFLARED_BIN" tunnel run --help 2>&1 | grep -q -- '--token-file' || \
-      die "当前 cloudflared 版本不支持 --token-file，请升级。"
+    ensure_cloudflared
 
     if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
       [[ -s $TUNNEL_TOKEN_FILE ]] || die "TUNNEL_TOKEN_FILE 不存在或为空。"
@@ -610,6 +686,8 @@ show_summary() {
   printf '  客户端配置: %s（仅 root 可读）\n' "$CLIENT_PATH"
   printf '  核心配置: %s\n' "$CONFIG_PATH"
   printf '  WebSocket 路径: %s…%s\n' "${WS_PATH:0:12}" "${WS_PATH: -4}"
+  printf '\n%b\n' "${COLOR_GREEN}VMess 链接:${COLOR_RESET}"
+  cat "$CLIENT_PATH"
 
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
     warn "请确认 Cloudflare Tunnel 的 Published application 指向 http://127.0.0.1:${ORIGIN_PORT}。"

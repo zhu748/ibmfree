@@ -17,23 +17,14 @@
 
 ### Tunnel 模式
 
-适合使用 Cloudflare Tunnel 的环境。公网 TLS 在 Cloudflare 终止，Nginx 只监听 `127.0.0.1:18080`。
+适合使用 Cloudflare Tunnel 的环境。公网 TLS 在 Cloudflare 终止，Nginx 只监听 `127.0.0.1:8001`。
 
-Cloudflare 官方没有提供 s390x 发布资产，因此必须从官方源码构建：
-
-1. 在 GitHub Actions 中手动运行 `Build cloudflared for s390x`；
-2. 下载 `cloudflared-2026.8.2-linux-s390x` 产物；
-3. 在服务器验证随附的 SHA-256 后安装：
-
-```bash
-sha256sum --check cloudflared-linux-s390x.sha256
-sudo install -o root -g root -m 0755 cloudflared-linux-s390x /usr/local/bin/cloudflared
-```
+Cloudflare 官方没有提供 s390x 发布资产，因此本仓库通过 GitHub Actions 从固定的官方源码提交构建并发布。安装器会自动下载和校验，不需要手工上传二进制。
 
 在 Cloudflare Tunnel 的 Published application 中，将公网域名映射到：
 
 ```text
-http://127.0.0.1:18080
+http://127.0.0.1:8001
 ```
 
 安装器会把 Tunnel Token 保存为仅服务账户可读的文件，并通过 `--token-file` 启动，Token 不会出现在进程参数中。
@@ -46,25 +37,26 @@ http://127.0.0.1:18080
 
 ## 安装
 
-请克隆完整仓库后运行，不要使用 `curl | bash`，因为安装器依赖仓库内经过版本控制的模板：
+先在 Cloudflare Tunnel 中将 Published application 设置为 `http://127.0.0.1:8001`，然后在 s390x VPS 上切换到 root：
 
-Tunnel 模式没有新增必填输入：仍使用域名、UUID（未提供时自动生成）和 Cloudflare Tunnel Token。
+```bash
+sudo -i
+```
+
+执行一条命令：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstrap.sh)
+```
+
+安装器只会要求 UUID（可留空自动生成）、公网域名和 Cloudflare Tunnel Token。完成后会直接打印 `vmess://` 链接。重复安装时会复用现有 UUID、WebSocket 路径和内部端口，避免旧客户端无故失效。引导脚本会下载完整仓库归档，正式安装仍由仓库中的模板化安装器执行。
+
+也可以克隆仓库后运行：
 
 ```bash
 git clone https://github.com/zhu748/ibmfree.git
 cd ibmfree
 sudo bash install.sh
-```
-
-也可以通过环境变量进行非交互配置：
-
-```bash
-sudo PUBLIC_DOMAIN=edge.example.com \
-  UUID=11111111-1111-4111-8111-111111111111 \
-  DEPLOY_MODE=tunnel \
-  CLOUDFLARED_BIN=/usr/local/bin/cloudflared \
-  TUNNEL_TOKEN_FILE=/root/tunnel-token.txt \
-  bash install.sh
 ```
 
 Direct 模式额外使用：
@@ -83,7 +75,7 @@ sudo PUBLIC_DOMAIN=edge.example.com \
 | --- | --- | --- |
 | `UUID` | 随机 | 客户端 UUID |
 | `WS_PATH` | 两段完全随机路径 | WebSocket 路径 |
-| `ORIGIN_PORT` | `18080` | Tunnel 模式的本地 Nginx 端口 |
+| `ORIGIN_PORT` | `8001` | Tunnel 模式的本地 Nginx 端口 |
 | `SING_BOX_PORT` | 随机空闲端口 | sing-box 回环监听端口 |
 | `SITE_INDEX_FILE` | 自动生成 | 可选的自备静态首页文件，不会增加交互问题 |
 
@@ -93,7 +85,7 @@ sudo PUBLIC_DOMAIN=edge.example.com \
 /etc/edge-router/client.txt
 ```
 
-该文件权限为 `0600`，不会通过 Web 服务暴露。
+该文件权限为 `0600`，不会通过 Web 服务暴露；安装完成时也会按用户要求在终端打印一次。
 
 ## 验证与排错
 

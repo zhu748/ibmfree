@@ -10,7 +10,11 @@ on:
       - "scripts/build-cloudflared-s390x.sh"
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  CLOUDFLARED_VERSION: "2026.8.2"
+  RELEASE_TAG: "cloudflared-2026.8.2-s390x"
 
 jobs:
   build:
@@ -47,3 +51,21 @@ jobs:
             dist/cloudflared-linux-s390x.manifest
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish public release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(
+            dist/cloudflared-linux-s390x
+            dist/cloudflared-linux-s390x.sha256
+            dist/cloudflared-linux-s390x.manifest
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "cloudflared ${CLOUDFLARED_VERSION} for linux/s390x" \
+              --notes "Pinned linux/s390x build used by the ibmfree one-command installer."
+          fi

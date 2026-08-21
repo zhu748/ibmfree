@@ -328,7 +328,11 @@ read_json_number() {
 }
 
 collect_configuration() {
-  local existing_path existing_port existing_uuid generated_uuid tunnel_token=""
+  local existing_path=""
+  local existing_port=""
+  local existing_uuid=""
+  local generated_uuid=""
+  local tunnel_token=""
 
   if [[ -s $CONFIG_PATH ]]; then
     existing_uuid=$(read_json_string "$CONFIG_PATH" uuid)

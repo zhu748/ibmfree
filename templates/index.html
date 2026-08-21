@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Northline Workspace</title>
+  <style>
+    :root {
+      font-family: Aptos, "Segoe UI", sans-serif;
+      color: #182736;
+      background: #e9eff3;
+      font-synthesis: none;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background:
+        linear-gradient(90deg, rgb(24 39 54 / 5%) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        linear-gradient(rgb(24 39 54 / 5%) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
+        #e9eff3;
+    }
+
+    main {
+      position: relative;
+      width: min(62rem, calc(100% - 2rem));
+      min-height: 32rem;
+      display: grid;
+      grid-template-columns: 5rem 1fr;
+      overflow: hidden;
+      border: 1px solid #b7c5cf;
+      background: #f8fafb;
+      box-shadow: 0 1.8rem 5rem rgb(24 39 54 / 14%);
+    }
+
+    .rail {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-right: 1px solid #b7c5cf;
+      background: #163b65;
+      color: #f8fafb;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      font-family: ui-monospace, "Cascadia Mono", monospace;
+      font-size: .72rem;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+    }
+
+    .content {
+      display: grid;
+      align-content: space-between;
+      gap: 5rem;
+      padding: clamp(2rem, 7vw, 5.5rem);
+    }
+
+    .eyebrow {
+      margin: 0 0 1.2rem;
+      color: #2f6f9f;
+      font-family: ui-monospace, "Cascadia Mono", monospace;
+      font-size: .74rem;
+      font-weight: 700;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 11ch;
+      margin: 0;
+      font-family: "Arial Narrow", Aptos, sans-serif;
+      font-size: clamp(3.25rem, 10vw, 7.5rem);
+      font-stretch: condensed;
+      font-weight: 760;
+      letter-spacing: -.065em;
+      line-height: .86;
+    }
+
+    .summary {
+      max-width: 34rem;
+      margin: 1.7rem 0 0;
+      color: #526574;
+      font-size: 1rem;
+      line-height: 1.75;
+    }
+
+    .status {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
+      gap: 1rem;
+      padding-top: 1.25rem;
+      border-top: 1px solid #b7c5cf;
+      font-family: ui-monospace, "Cascadia Mono", monospace;
+      font-size: .78rem;
+      letter-spacing: .06em;
+    }
+
+    .signal {
+      width: .7rem;
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: #23856d;
+      box-shadow: 0 0 0 .32rem rgb(35 133 109 / 12%);
+    }
+
+    .rule { height: 1px; background: #cfdae1; }
+    .state { color: #176b59; font-weight: 750; text-transform: uppercase; }
+
+    @media (max-width: 38rem) {
+      main { grid-template-columns: 3.25rem 1fr; min-height: calc(100vh - 2rem); }
+      .content { gap: 3rem; padding: 2rem 1.4rem; }
+      h1 { font-size: clamp(3rem, 17vw, 5rem); }
+      .status { grid-template-columns: auto 1fr; }
+      .rule { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside class="rail">Northline / Public workspace</aside>
+    <section class="content">
+      <div>
+        <p class="eyebrow">Workspace availability</p>
+        <h1>Quietly online.</h1>
+        <p class="summary">此工作区用于托管公开文档与项目页面。维护窗口和可用性变化会在这里更新。</p>
+      </div>
+      <div class="status" aria-label="当前状态：服务正常">
+        <span class="signal" aria-hidden="true"></span>
+        <span class="rule" aria-hidden="true"></span>
+        <span class="state">Operational</span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,246 +1,463 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Author: Joey
-# Blog: joeyblog.net
-# Feedback TG (Feedback Telegram): https://t.me/+ft-zI76oovgwNmRh
-# Core Functionality By:
-#   - https://github.com/eooce
-# Version: 2.4.8.sh (macOS - sed delimiter, panel URL opening with https default) - Modified by User Request
+set -Eeuo pipefail
+umask 077
 
-# --- Color Definitions ---
+readonly SING_BOX_VERSION="1.13.19"
+readonly SERVICE_NAME="edge-router"
+readonly TUNNEL_SERVICE_NAME="edge-tunnel"
+readonly CONFIG_DIR="/etc/edge-router"
+readonly CONFIG_PATH="${CONFIG_DIR}/config.json"
+readonly CLIENT_PATH="${CONFIG_DIR}/client.txt"
+readonly TOKEN_PATH="${CONFIG_DIR}/tunnel.token"
+readonly TLS_CERT_PATH="${CONFIG_DIR}/tls/origin.crt"
+readonly TLS_KEY_PATH="${CONFIG_DIR}/tls/origin.key"
+readonly SING_BOX_BIN="/usr/local/libexec/edge-router"
+readonly SITE_ROOT="/var/www/edge-router"
+readonly NGINX_CONFIG="/etc/nginx/conf.d/edge-router.conf"
+readonly SYSTEMD_DIR="/etc/systemd/system"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEMPLATE_DIR="${SCRIPT_DIR}/templates"
+
 COLOR_RED='\033[0;31m'
 COLOR_GREEN='\033[0;32m'
 COLOR_YELLOW='\033[0;33m'
-COLOR_MAGENTA='\033[0;35m'
 COLOR_CYAN='\033[0;36m'
-COLOR_RESET='\033[0m' # No Color
+COLOR_RESET='\033[0m'
 
-echo -e "${COLOR_MAGENTA}欢迎使用 IBM-sb-ws 配置脚本!${COLOR_RESET}"
-echo -e "${COLOR_MAGENTA}此脚本由 Joey (joeyblog.net) 提供，用于简化配置流程。${COLOR_RESET}"
-echo -e "${COLOR_MAGENTA}核心功能老王实现 eooce 。${COLOR_RESET}"
-echo -e "${COLOR_MAGENTA}如果您对此脚本有任何反馈，请通过 Telegram 联系: https://t.me/+ft-zI76oovgwNmRh${COLOR_RESET}"
-echo -e "${COLOR_MAGENTA}--------------------------------------------------------------------------${COLOR_RESET}"
+PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
+DEPLOY_MODE="${DEPLOY_MODE:-}"
+CUSTOM_UUID="${UUID:-}"
+WS_PATH="${WS_PATH:-}"
+ORIGIN_PORT="${ORIGIN_PORT:-18080}"
+SING_BOX_PORT="${SING_BOX_PORT:-}"
+TLS_CERT_FILE="${TLS_CERT_FILE:-}"
+TLS_KEY_FILE="${TLS_KEY_FILE:-}"
+TUNNEL_TOKEN_FILE="${TUNNEL_TOKEN_FILE:-}"
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-}"
+TEMP_DIR=""
 
-echo -e "${COLOR_GREEN}==================== Webhostmost-ws-nodejs 配置生成脚本 ====================${COLOR_RESET}"
+info() {
+  printf '%b\n' "${COLOR_CYAN}$*${COLOR_RESET}"
+}
 
+success() {
+  printf '%b\n' "${COLOR_GREEN}$*${COLOR_RESET}"
+}
 
-# --- Environment Preparation and Detection ---
+warn() {
+  printf '%b\n' "${COLOR_YELLOW}$*${COLOR_RESET}" >&2
+}
 
-#!/bin/bash
+die() {
+  printf '%b\n' "${COLOR_RED}错误: $*${COLOR_RESET}" >&2
+  exit 1
+}
 
-# --- 读取用户输入的函数 ---
-read_input() {
-  local prompt_text="$1"
-  local variable_name="$2"
-  local default_value="$3"
-  local advice_text="$4"
-
-  if [ -n "$advice_text" ]; then
-    echo -e "\033[36m$advice_text\033[0m"
+cleanup() {
+  if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+    find "$TEMP_DIR" -mindepth 1 -maxdepth 3 -type f -delete 2>/dev/null || true
+    find "$TEMP_DIR" -mindepth 1 -maxdepth 3 -type d -empty -delete 2>/dev/null || true
+    rmdir "$TEMP_DIR" 2>/dev/null || true
   fi
+}
 
-  if [ -n "$default_value" ]; then
-    read -p "$prompt_text [$default_value]: " user_input
-    eval "$variable_name=\"${user_input:-$default_value}\""
+on_error() {
+  local exit_code=$?
+  printf '%b\n' "${COLOR_RED}安装在第 ${BASH_LINENO[0]} 行失败（退出码: ${exit_code}）。${COLOR_RESET}" >&2
+  exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap on_error ERR
+
+require_file() {
+  [[ -f $1 ]] || die "缺少仓库文件: $1。请克隆完整仓库后运行，不要使用 curl | bash。"
+}
+
+read_value() {
+  local variable_name=$1
+  local prompt_text=$2
+  local default_value=${3-}
+  local secret=${4-false}
+  local current_value=${!variable_name-}
+  local user_input=""
+
+  [[ -n "$current_value" ]] && return 0
+
+  if [[ -n "$default_value" ]]; then
+    prompt_text+=" [${default_value}]"
+  fi
+  prompt_text+=": "
+
+  if [[ "$secret" == "true" ]]; then
+    IFS= read -r -s -p "$prompt_text" user_input || true
+    printf '\n'
   else
-    read -p "$prompt_text: " user_input
-    eval "$variable_name=\"$user_input\""
+    IFS= read -r -p "$prompt_text" user_input || true
   fi
-  echo # 新行以提高可读性
+
+  printf -v "$variable_name" '%s' "${user_input:-$default_value}"
 }
 
-# --- 初始化变量 (部分变量有默认值，可在自定义安装中修改) ---
-CUSTOM_UUID="" # 将在脚本开始时处理
-NEZHA_SERVER=""
-NEZHA_PORT=""
-NEZHA_KEY=""
-ARGO_DOMAIN=""
-ARGO_AUTH=""
-NAME="ibm" # 节点名称默认值
-CFIP="cloudflare.182682.xyz"   
-CFPORT="443" 
-CHAT_ID=""
-BOT_TOKEN=""
-UPLOAD_URL=""
+random_hex() {
+  local byte_count=${1:-12}
 
-# --- UUID 处理函数 ---
-handle_uuid_generation() {
-  echo -e "\033[1mUUID 配置:\033[0m"
-  read_input "请输入您要使用的 UUID (如果留空，脚本将使用 \`uuidgen\` 自动生成一个):" CUSTOM_UUID ""
-  if [ -z "$CUSTOM_UUID" ]; then
-    if command -v uuidgen &> /dev/null; then
-      CUSTOM_UUID=$(uuidgen)
-      echo -e "\033[32m已自动生成 UUID: $CUSTOM_UUID\033[0m"
-    else
-      echo -e "\033[31m错误: \`uuidgen\` 命令未找到。请安装 \`uuidgen\` (通常在 util-linux 包中) 或手动提供一个 UUID。\033[0m"
-      # 在此可以选择退出脚本或再次请求输入
-      read_input "请手动输入一个 UUID:" CUSTOM_UUID ""
-      if [ -z "$CUSTOM_UUID" ]; then
-        echo -e "\033[31m未提供 UUID，脚本无法继续。\033[0m"
-        exit 1
-      fi
-    fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$byte_count"
+  elif [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1; then
+    od -An -N "$byte_count" -tx1 /dev/urandom | tr -d ' \n'
   else
-    echo -e "\033[32m将使用您提供的 UUID: $CUSTOM_UUID\033[0m"
+    die "无法生成安全随机值，请安装 openssl 或提供 /dev/urandom。"
   fi
-  echo
 }
 
-# --- 执行部署函数 ---
-run_deployment() {
-  echo "---------------------------------------------------------------------"
-  echo "配置预览:"
-  echo "  UUID: \"$CUSTOM_UUID\"" # CUSTOM_UUID 现在总会有一个值
-  echo "  NEZHA_SERVER: \"$NEZHA_SERVER\""
-  echo "  NEZHA_PORT: \"$NEZHA_PORT\""
-  echo "  NEZHA_KEY: \"$NEZHA_KEY\""
-  echo "  ARGO_DOMAIN: \"$ARGO_DOMAIN\""
-  echo "  ARGO_AUTH: \"$ARGO_AUTH\""
-  echo "  NAME: \"$NAME\""
-  echo "  CFIP: \"$CFIP\""
-  echo "  CFPORT: \"$CFPORT\""
-  echo "  CHAT_ID: \"$CHAT_ID\""
-  echo "  BOT_TOKEN: \"$BOT_TOKEN\""
-  echo "  UPLOAD_URL: \"$UPLOAD_URL\""
-  echo "---------------------------------------------------------------------"
-  echo "准备执行部署脚本 (sb.sh)..."
-  
-  export UUID="$CUSTOM_UUID"
-  export NEZHA_SERVER="$NEZHA_SERVER"
-  export NEZHA_PORT="$NEZHA_PORT"
-  export NEZHA_KEY="$NEZHA_KEY"
-  export ARGO_DOMAIN="$ARGO_DOMAIN"
-  export ARGO_AUTH="$ARGO_AUTH"
-  export NAME="$NAME"
-  export CFIP="$CFIP"
-  export CFPORT="$CFPORT"
-  export CHAT_ID="$CHAT_ID"
-  export BOT_TOKEN="$BOT_TOKEN"
-  export UPLOAD_URL="$UPLOAD_URL"
-
-  echo "开始执行: bash <(curl -Ls https://main.ssss.nyc.mn/sb.sh)"
-  bash <(curl -Ls https://main.ssss.nyc.mn/sb.sh)
-  echo "---------------------------------------------------------------------"
-  echo "部署脚本执行完毕。"
-  echo "---------------------------------------------------------------------"
+generate_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    tr -d '\r\n' </proc/sys/kernel/random/uuid
+  else
+    die "无法生成 UUID，请安装 uuidgen。"
+  fi
 }
 
+validate_uuid() {
+  [[ $1 =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]
+}
 
-# --- 主菜单 ---
-echo "---------------------------------------------------------------------"
-echo "部署脚本配置向导"
-echo "---------------------------------------------------------------------"
-echo "请选择安装模式:"
-echo "  1) 推荐安装 (仅需确认或自定义 UUID，其他参数默认)"
-echo "  2) 自定义安装 (手动配置各项参数)"
-echo "  Q) 退出"
-echo "---------------------------------------------------------------------"
-read -p "请输入选项 [1]: " main_choice
-main_choice=${main_choice:-1}
+validate_domain() {
+  [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
 
-case "$main_choice" in
-  1) # --- 推荐安装 ---
-    echo
-    echo "--- 推荐安装模式 ---"
-    echo "此模式将使用最简配置。节点名称默认为 'ibm'。"
-    
-    handle_uuid_generation # 处理 UUID
+validate_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535))
+}
 
-    # 推荐安装的特定默认值 (大部分为空)
-    NEZHA_SERVER=""
-    NEZHA_PORT=""
-    NEZHA_KEY=""
-    ARGO_DOMAIN=""
-    ARGO_AUTH=""
-    NAME="ibm" # 节点名称保留一个默认值
-    CFIP="cloudflare.182682.xyz"
-    CFPORT="443"
-    CHAT_ID=""
-    BOT_TOKEN=""
-    UPLOAD_URL=""
-    
-    run_deployment
-    ;;
+validate_ws_path() {
+  [[ $1 =~ ^/[A-Za-z0-9/_-]{15,119}$ ]] && [[ $1 != *//* ]] && [[ $1 != */ ]]
+}
 
-  2) # --- 自定义安装 ---
-    echo
-    echo "--- 自定义安装模式 ---"
-    
-    handle_uuid_generation # 处理 UUID
+choose_internal_port() {
+  local candidate=""
+  local attempts=0
 
-    echo
-    read -p "是否配置哪吒探针? (y/N): " configure_section
-    if [[ "$(echo "$configure_section" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
-      read_input "哪吒面板域名:" NEZHA_SERVER "" "v1 格式: nezha.xxx.com:8008; v0 格式: nezha.xxx.com"
-      read -p "您输入的哪吒面板域名是否已包含端口 (v1版特征)? (y/N): " nezha_v1_style
-      if [[ "$(echo "$nezha_v1_style" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
-        NEZHA_PORT=""
-        echo -e "\033[36mNEZHA_PORT 将留空 (v1 类型配置)。\033[0m"
-      else
-        read_input "哪吒 Agent 端口 (v0 版使用):" NEZHA_PORT "" "v0 端口为 {443,8443,2096,2087,2083,2053} 之一时开启TLS"
-      fi
-      read_input "哪吒 NZ_CLIENT_SECRET (v1) 或 Agent 密钥 (v0):" NEZHA_KEY
-    else
-      NEZHA_SERVER=""
-      NEZHA_PORT=""
-      NEZHA_KEY=""
+  while ((attempts < 100)); do
+    candidate=$((20000 + (((RANDOM << 1) ^ RANDOM) % 20000)))
+    if ! ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$candidate$"; then
+      printf '%s' "$candidate"
+      return 0
     fi
+    ((attempts += 1))
+  done
 
-    echo
-    read -p "是否配置 Argo 隧道? (y/N): " configure_section
-    if [[ "$(echo "$configure_section" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
-      read_input "Argo 域名 (留空则启用临时隧道):" ARGO_DOMAIN ""
-      if [ -n "$ARGO_DOMAIN" ]; then
-        read_input "Argo Token 或 JSON:" ARGO_AUTH
-      else
-        ARGO_AUTH=""
-        echo -e "\033[36m将使用 Argo 临时隧道，无需 ARGO_AUTH。\033[0m"
-      fi
-    else
-      ARGO_DOMAIN=""
-      ARGO_AUTH=""
+  die "无法选择空闲的内部端口。"
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64)
+      printf '%s %s\n' "amd64" "ef88a9e577d474210867bd708933d042e9b70106529df2656182c9db90106aa1"
+      ;;
+    aarch64 | arm64)
+      printf '%s %s\n' "arm64" "7fe3597a95a3c5ad67477b1d7653b9ce097e0be7c676758eba1fcf558f353d57"
+      ;;
+    s390x | s390)
+      printf '%s %s\n' "s390x" "23843202066901798b1df4a136a9c275f82e2ac3f27f24e82604206bcfd717b0"
+      ;;
+    *)
+      die "不支持的系统架构: $(uname -m)"
+      ;;
+  esac
+}
+
+sha256_file() {
+  local file=$1
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | awk '{print $NF}'
+  else
+    die "找不到 SHA-256 校验工具。"
+  fi
+}
+
+download_file() {
+  local url=$1
+  local output=$2
+
+  curl --fail --location --silent --show-error \
+    --retry 3 --connect-timeout 15 --max-time 300 \
+    --output "$output" "$url"
+}
+
+install_packages() {
+  info "检查基础依赖……"
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates coreutils curl iproute2 nginx tar
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates coreutils curl iproute nginx tar
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ca-certificates coreutils curl iproute nginx tar
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install ca-certificates coreutils curl iproute2 nginx tar
+  else
+    die "不支持的包管理器，请先安装 curl、tar、ca-certificates 和 nginx。"
+  fi
+
+  command -v curl >/dev/null 2>&1 || die "curl 安装失败。"
+  command -v nginx >/dev/null 2>&1 || die "nginx 安装失败。"
+  command -v ss >/dev/null 2>&1 || die "缺少 ss 命令（通常由 iproute2 提供）。"
+}
+
+collect_configuration() {
+  local tunnel_token=""
+
+  read_value PUBLIC_DOMAIN "公网域名"
+  validate_domain "$PUBLIC_DOMAIN" || die "公网域名格式无效。"
+
+  read_value DEPLOY_MODE "部署模式（tunnel/direct）" "tunnel"
+  DEPLOY_MODE=${DEPLOY_MODE,,}
+  [[ $DEPLOY_MODE == "tunnel" || $DEPLOY_MODE == "direct" ]] || die "部署模式只能是 tunnel 或 direct。"
+
+  if [[ -z "$CUSTOM_UUID" ]]; then
+    CUSTOM_UUID=$(generate_uuid)
+  fi
+  validate_uuid "$CUSTOM_UUID" || die "UUID 格式无效。"
+
+  if [[ -z "$WS_PATH" ]]; then
+    WS_PATH="/api/events/$(random_hex 16)"
+  fi
+  validate_ws_path "$WS_PATH" || die "WS_PATH 必须是 16-120 位安全路径，且不能以 / 结尾。"
+
+  validate_port "$ORIGIN_PORT" || die "ORIGIN_PORT 必须是 1024-65535 之间的端口。"
+  if [[ -z "$SING_BOX_PORT" ]]; then
+    SING_BOX_PORT=$(choose_internal_port)
+  fi
+  validate_port "$SING_BOX_PORT" || die "SING_BOX_PORT 必须是 1024-65535 之间的端口。"
+  [[ $SING_BOX_PORT != "$ORIGIN_PORT" ]] || die "两个内部端口不能相同。"
+
+  if [[ $DEPLOY_MODE == "direct" ]]; then
+    read_value TLS_CERT_FILE "TLS 证书文件路径"
+    read_value TLS_KEY_FILE "TLS 私钥文件路径"
+    [[ -s $TLS_CERT_FILE ]] || die "TLS 证书不存在或为空。"
+    [[ -s $TLS_KEY_FILE ]] || die "TLS 私钥不存在或为空。"
+  else
+    if [[ -z "$CLOUDFLARED_BIN" ]]; then
+      CLOUDFLARED_BIN=$(command -v cloudflared || true)
     fi
-    
-    echo
-    read -p "是否进行其他配置 (节点名称, CFIP, Telegram等)? (y/N): " configure_section
-    if [[ "$(echo "$configure_section" | tr '[:upper:]' '[:lower:]')" == "y" ]]; then
-      read_input "节点名称:" NAME "${NAME}" # 使用当前的NAME作为默认值
-      read_input "优选 IP 或域名 (CFIP, 可选):" CFIP ""
-      if [ -n "$CFIP" ]; then
-          read_input "CFIP 对应端口:" CFPORT "443"
-      else
-          CFPORT=""
-      fi
-      read_input "Telegram Chat ID (可选):" CHAT_ID ""
-      if [ -n "$CHAT_ID" ]; then
-        read_input "Telegram Bot Token (可选,需与Chat ID一同填写):" BOT_TOKEN ""
-      else
-        BOT_TOKEN=""
-      fi
-      read_input "节点信息上传 URL (可选, merge-sub 地址):" UPLOAD_URL ""
+    [[ $CLOUDFLARED_BIN =~ ^/[A-Za-z0-9_./-]+$ ]] || die "cloudflared 路径包含不安全字符。"
+    [[ -x $CLOUDFLARED_BIN ]] || die "tunnel 模式需要 cloudflared。请先运行仓库的 s390x 构建工作流并安装产物。"
+    "$CLOUDFLARED_BIN" tunnel run --help 2>&1 | grep -q -- '--token-file' || \
+      die "当前 cloudflared 版本不支持 --token-file，请升级。"
+
+    if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
+      [[ -s $TUNNEL_TOKEN_FILE ]] || die "TUNNEL_TOKEN_FILE 不存在或为空。"
     else
-      # 如果用户跳过“其他配置”，则 NAME 等使用初始默认值或之前步骤的值
-      # NAME 仍为 "ibm" (除非前面被修改), 其他可选配置保持为空
-      CFIP="" # 确保可选的这些是空的，除非用户主动配置
-      CFPORT=""
-      CHAT_ID=""
-      BOT_TOKEN=""
-      UPLOAD_URL=""
-      echo -e "\033[36m其他可选配置将使用默认值或留空。\033[0m"
+      read_value tunnel_token "Cloudflare Tunnel Token" "" true
+      [[ -n "$tunnel_token" ]] || die "Tunnel Token 不能为空。"
+      TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+      TUNNEL_TOKEN_FILE="${TEMP_DIR}/tunnel.token"
+      printf '%s' "$tunnel_token" >"$TUNNEL_TOKEN_FILE"
+      unset tunnel_token
     fi
+  fi
+}
 
-    run_deployment
-    ;;
+create_service_user() {
+  if ! getent group edge-router >/dev/null 2>&1; then
+    groupadd --system edge-router
+  fi
+  if ! id edge-router >/dev/null 2>&1; then
+    useradd --system --gid edge-router --no-create-home --home-dir /nonexistent \
+      --shell /usr/sbin/nologin edge-router
+  fi
+}
 
-  [Qq]*)
-    echo "已退出向导。"
-    exit 0
-    ;;
+backup_file() {
+  local path=$1
+  local stamp
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
 
-  *)
-    echo "无效选项，已退出。"
-    exit 1
-    ;;
-esac
+  if [[ -e $path || -L $path ]]; then
+    cp --archive --no-dereference "$path" "${path}.bak.${stamp}"
+  fi
+}
 
-exit 0
+install_sing_box() {
+  local arch expected_hash actual_hash archive extract_dir source_bin url
+
+  read -r arch expected_hash < <(detect_arch)
+  TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+  archive="${TEMP_DIR}/sing-box.tar.gz"
+  extract_dir="${TEMP_DIR}/extract"
+  url="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-${arch}.tar.gz"
+
+  info "下载 sing-box ${SING_BOX_VERSION} 官方 ${arch} 发布包……"
+  download_file "$url" "$archive"
+  actual_hash=$(sha256_file "$archive")
+  [[ ${actual_hash,,} == "$expected_hash" ]] || \
+    die "sing-box 校验失败。期望 ${expected_hash}，实际 ${actual_hash}。"
+
+  mkdir -p "$extract_dir"
+  tar -xzf "$archive" -C "$extract_dir"
+  source_bin="${extract_dir}/sing-box-${SING_BOX_VERSION}-linux-${arch}/sing-box"
+  [[ -f $source_bin ]] || die "发布包结构不符合预期。"
+
+  install -d -m 0755 "$(dirname "$SING_BOX_BIN")"
+  install -o root -g root -m 0755 "$source_bin" "$SING_BOX_BIN"
+  success "sing-box 官方发布包校验并安装完成。"
+}
+
+render_file() {
+  local template=$1
+  local destination=$2
+
+  sed \
+    -e "s|{{UUID}}|${CUSTOM_UUID}|g" \
+    -e "s|{{WS_PATH}}|${WS_PATH}|g" \
+    -e "s|{{PUBLIC_DOMAIN}}|${PUBLIC_DOMAIN}|g" \
+    -e "s|{{ORIGIN_PORT}}|${ORIGIN_PORT}|g" \
+    -e "s|{{SING_BOX_PORT}}|${SING_BOX_PORT}|g" \
+    -e "s|{{SITE_ROOT}}|${SITE_ROOT}|g" \
+    -e "s|{{TLS_CERT_PATH}}|${TLS_CERT_PATH}|g" \
+    -e "s|{{TLS_KEY_PATH}}|${TLS_KEY_PATH}|g" \
+    -e "s|{{SING_BOX_BIN}}|${SING_BOX_BIN}|g" \
+    -e "s|{{CONFIG_PATH}}|${CONFIG_PATH}|g" \
+    -e "s|{{CLOUDFLARED_BIN}}|${CLOUDFLARED_BIN}|g" \
+    -e "s|{{TOKEN_FILE}}|${TOKEN_PATH}|g" \
+    "$template" >"$destination"
+}
+
+write_configuration() {
+  local nginx_template rendered_config rendered_nginx rendered_service rendered_tunnel
+
+  TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+  rendered_config="${TEMP_DIR}/config.json"
+  rendered_nginx="${TEMP_DIR}/nginx.conf"
+  rendered_service="${TEMP_DIR}/edge-router.service"
+  rendered_tunnel="${TEMP_DIR}/edge-tunnel.service"
+
+  render_file "${TEMPLATE_DIR}/sing-box.json.tpl" "$rendered_config"
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    nginx_template="${TEMPLATE_DIR}/nginx-tunnel.conf.tpl"
+  else
+    nginx_template="${TEMPLATE_DIR}/nginx-direct.conf.tpl"
+  fi
+  render_file "$nginx_template" "$rendered_nginx"
+  render_file "${TEMPLATE_DIR}/edge-router.service.tpl" "$rendered_service"
+
+  "$SING_BOX_BIN" check -c "$rendered_config"
+
+  install -d -o root -g edge-router -m 0750 "$CONFIG_DIR"
+  install -d -o root -g root -m 0755 "$SITE_ROOT"
+  install -d -o root -g root -m 0755 "$(dirname "$NGINX_CONFIG")"
+  install -o root -g root -m 0644 "${TEMPLATE_DIR}/index.html" "${SITE_ROOT}/index.html"
+
+  backup_file "$CONFIG_PATH"
+  backup_file "$NGINX_CONFIG"
+  backup_file "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+  install -o root -g edge-router -m 0640 "$rendered_config" "$CONFIG_PATH"
+  install -o root -g root -m 0644 "$rendered_nginx" "$NGINX_CONFIG"
+  install -o root -g root -m 0644 "$rendered_service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+
+  if [[ $DEPLOY_MODE == "direct" ]]; then
+    install -d -o root -g root -m 0700 "${CONFIG_DIR}/tls"
+    install -o root -g root -m 0600 "$TLS_CERT_FILE" "$TLS_CERT_PATH"
+    install -o root -g root -m 0600 "$TLS_KEY_FILE" "$TLS_KEY_PATH"
+  else
+    install -o edge-router -g edge-router -m 0400 "$TUNNEL_TOKEN_FILE" "$TOKEN_PATH"
+    render_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl" "$rendered_tunnel"
+    backup_file "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
+    install -o root -g root -m 0644 "$rendered_tunnel" "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
+  fi
+}
+
+write_client_link() {
+  local client_json encoded_link
+
+  client_json=$(printf \
+    '{"v":"2","ps":"application-edge","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","fp":"chrome"}' \
+    "$PUBLIC_DOMAIN" "$CUSTOM_UUID" "$PUBLIC_DOMAIN" "$WS_PATH" "$PUBLIC_DOMAIN")
+  encoded_link=$(printf '%s' "$client_json" | base64 | tr -d '\r\n')
+  printf 'vmess://%s\n' "$encoded_link" | install -o root -g root -m 0600 /dev/stdin "$CLIENT_PATH"
+}
+
+activate_services() {
+  local nginx_dump
+
+  nginx -t
+  nginx_dump=$(nginx -T 2>&1)
+  [[ $nginx_dump == *"configuration file ${NGINX_CONFIG}:"* ]] || \
+    die "nginx 主配置未包含 ${NGINX_CONFIG}。"
+
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+    if [[ $DEPLOY_MODE == "tunnel" ]]; then
+      systemd-analyze verify "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
+    fi
+  fi
+
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE_NAME"
+  systemctl enable --now nginx
+  systemctl reload nginx
+
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    systemctl enable --now "$TUNNEL_SERVICE_NAME"
+  else
+    systemctl disable --now "$TUNNEL_SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
+
+  systemctl is-active --quiet "$SERVICE_NAME" || die "${SERVICE_NAME} 未成功启动。"
+  systemctl is-active --quiet nginx || die "nginx 未成功启动。"
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    systemctl is-active --quiet "$TUNNEL_SERVICE_NAME" || die "${TUNNEL_SERVICE_NAME} 未成功启动。"
+  fi
+}
+
+show_summary() {
+  printf '\n%b\n' "${COLOR_GREEN}部署完成${COLOR_RESET}"
+  printf '  公网域名: https://%s\n' "$PUBLIC_DOMAIN"
+  printf '  模式: %s\n' "$DEPLOY_MODE"
+  printf '  客户端配置: %s（仅 root 可读）\n' "$CLIENT_PATH"
+  printf '  核心配置: %s\n' "$CONFIG_PATH"
+  printf '  WebSocket 路径: %s…%s\n' "${WS_PATH:0:12}" "${WS_PATH: -4}"
+
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    warn "请确认 Cloudflare Tunnel 的 Published application 指向 http://127.0.0.1:${ORIGIN_PORT}。"
+  else
+    warn "direct 模式请确保域名已解析到本机，并仅开放必要的 443/TCP 入站。"
+  fi
+}
+
+main() {
+  ((EUID == 0)) || die "请使用 sudo 运行此脚本。"
+  [[ $(uname -s) == "Linux" ]] || die "仅支持 Linux。"
+  command -v systemctl >/dev/null 2>&1 || die "当前系统不使用 systemd。"
+
+  require_file "${TEMPLATE_DIR}/sing-box.json.tpl"
+  require_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl"
+  require_file "${TEMPLATE_DIR}/nginx-direct.conf.tpl"
+  require_file "${TEMPLATE_DIR}/edge-router.service.tpl"
+  require_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl"
+  require_file "${TEMPLATE_DIR}/index.html"
+
+  install_packages
+  collect_configuration
+  create_service_user
+  install_sing_box
+  write_configuration
+  write_client_link
+  activate_services
+  show_summary
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

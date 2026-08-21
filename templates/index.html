@@ -4,12 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Northline Workspace</title>
+  <title>{{SITE_TITLE}}</title>
   <style>
     :root {
       font-family: Aptos, "Segoe UI", sans-serif;
-      color: #182736;
-      background: #e9eff3;
+      --site-key: "{{SITE_NONCE}}";
+      --hue: {{SITE_HUE}};
+      --grid-size: {{SITE_GRID_SIZE}}rem;
+      color: hsl(var(--hue) 28% 17%);
+      background: hsl(var(--hue) 24% 93%);
       font-synthesis: none;
     }
 
@@ -21,9 +24,9 @@
       display: grid;
       place-items: center;
       background:
-        linear-gradient(90deg, rgb(24 39 54 / 5%) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
-        linear-gradient(rgb(24 39 54 / 5%) 1px, transparent 1px) 0 0 / 4.5rem 4.5rem,
-        #e9eff3;
+        linear-gradient(90deg, hsl(var(--hue) 28% 17% / 5%) 1px, transparent 1px) 0 0 / var(--grid-size) var(--grid-size),
+        linear-gradient(hsl(var(--hue) 28% 17% / 5%) 1px, transparent 1px) 0 0 / var(--grid-size) var(--grid-size),
+        hsl(var(--hue) 24% 93%);
     }
 
     main {
@@ -33,18 +36,18 @@
       display: grid;
       grid-template-columns: 5rem 1fr;
       overflow: hidden;
-      border: 1px solid #b7c5cf;
-      background: #f8fafb;
-      box-shadow: 0 1.8rem 5rem rgb(24 39 54 / 14%);
+      border: 1px solid hsl(var(--hue) 18% 76%);
+      background: hsl(var(--hue) 24% 98%);
+      box-shadow: 0 1.8rem 5rem hsl(var(--hue) 28% 17% / 14%);
     }
 
     .rail {
       display: flex;
       align-items: center;
       justify-content: center;
-      border-right: 1px solid #b7c5cf;
-      background: #163b65;
-      color: #f8fafb;
+      border-right: 1px solid hsl(var(--hue) 18% 76%);
+      background: hsl(var(--hue) 62% 27%);
+      color: hsl(var(--hue) 24% 98%);
       writing-mode: vertical-rl;
       transform: rotate(180deg);
       font-family: ui-monospace, "Cascadia Mono", monospace;
@@ -62,7 +65,7 @@
 
     .eyebrow {
       margin: 0 0 1.2rem;
-      color: #2f6f9f;
+      color: hsl(var(--hue) 54% 40%);
       font-family: ui-monospace, "Cascadia Mono", monospace;
       font-size: .74rem;
       font-weight: 700;
@@ -84,7 +87,7 @@
     .summary {
       max-width: 34rem;
       margin: 1.7rem 0 0;
-      color: #526574;
+      color: hsl(var(--hue) 18% 40%);
       font-size: 1rem;
       line-height: 1.75;
     }
@@ -95,7 +98,7 @@
       align-items: center;
       gap: 1rem;
       padding-top: 1.25rem;
-      border-top: 1px solid #b7c5cf;
+      border-top: 1px solid hsl(var(--hue) 18% 76%);
       font-family: ui-monospace, "Cascadia Mono", monospace;
       font-size: .78rem;
       letter-spacing: .06em;
@@ -105,12 +108,12 @@
       width: .7rem;
       aspect-ratio: 1;
       border-radius: 50%;
-      background: #23856d;
-      box-shadow: 0 0 0 .32rem rgb(35 133 109 / 12%);
+      background: hsl(158 58% 33%);
+      box-shadow: 0 0 0 .32rem hsl(158 58% 33% / 12%);
     }
 
-    .rule { height: 1px; background: #cfdae1; }
-    .state { color: #176b59; font-weight: 750; text-transform: uppercase; }
+    .rule { height: 1px; background: hsl(var(--hue) 18% 85%); }
+    .state { color: hsl(158 64% 26%); font-weight: 750; text-transform: uppercase; }
 
     @media (max-width: 38rem) {
       main { grid-template-columns: 3.25rem 1fr; min-height: calc(100vh - 2rem); }
@@ -123,17 +126,17 @@
 </head>
 <body>
   <main>
-    <aside class="rail">Northline / Public workspace</aside>
+    <aside class="rail">{{SITE_RAIL}}</aside>
     <section class="content">
       <div>
-        <p class="eyebrow">Workspace availability</p>
-        <h1>Quietly online.</h1>
-        <p class="summary">此工作区用于托管公开文档与项目页面。维护窗口和可用性变化会在这里更新。</p>
+        <p class="eyebrow">{{SITE_EYEBROW}}</p>
+        <h1>{{SITE_HEADING}}</h1>
+        <p class="summary">{{SITE_SUMMARY}}</p>
       </div>
       <div class="status" aria-label="当前状态：服务正常">
         <span class="signal" aria-hidden="true"></span>
         <span class="rule" aria-hidden="true"></span>
-        <span class="state">Operational</span>
+        <span class="state">{{SITE_STATE}}</span>
       </div>
     </section>
   </main>

@@ -10,6 +10,8 @@
 - 不提供公网订阅端点，客户端链接只保存在 root-only 文件中；
 - sing-box 仅监听 `127.0.0.1`，Nginx 负责正常站点和 Upgrade 转发；
 - systemd 服务启用权限收敛和文件系统保护。
+- 默认伪装页按部署生成不同的内容与配色，也可以使用自备首页；
+- 未知 Host/SNI 和不完整的 WebSocket 请求不会进入核心服务。
 
 ## 部署模式
 
@@ -46,6 +48,8 @@ http://127.0.0.1:18080
 
 请克隆完整仓库后运行，不要使用 `curl | bash`，因为安装器依赖仓库内经过版本控制的模板：
 
+Tunnel 模式没有新增必填输入：仍使用域名、UUID（未提供时自动生成）和 Cloudflare Tunnel Token。
+
 ```bash
 git clone https://github.com/zhu748/ibmfree.git
 cd ibmfree
@@ -56,6 +60,7 @@ sudo bash install.sh
 
 ```bash
 sudo PUBLIC_DOMAIN=edge.example.com \
+  UUID=11111111-1111-4111-8111-111111111111 \
   DEPLOY_MODE=tunnel \
   CLOUDFLARED_BIN=/usr/local/bin/cloudflared \
   TUNNEL_TOKEN_FILE=/root/tunnel-token.txt \
@@ -77,9 +82,10 @@ sudo PUBLIC_DOMAIN=edge.example.com \
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `UUID` | 随机 | 客户端 UUID |
-| `WS_PATH` | `/api/events/<随机值>` | WebSocket 路径 |
+| `WS_PATH` | 两段完全随机路径 | WebSocket 路径 |
 | `ORIGIN_PORT` | `18080` | Tunnel 模式的本地 Nginx 端口 |
 | `SING_BOX_PORT` | 随机空闲端口 | sing-box 回环监听端口 |
+| `SITE_INDEX_FILE` | 自动生成 | 可选的自备静态首页文件，不会增加交互问题 |
 
 部署完成后，客户端链接保存在：
 

@@ -35,7 +35,28 @@ TLS_CERT_FILE="${TLS_CERT_FILE:-}"
 TLS_KEY_FILE="${TLS_KEY_FILE:-}"
 TUNNEL_TOKEN_FILE="${TUNNEL_TOKEN_FILE:-}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-}"
+SITE_INDEX_FILE="${SITE_INDEX_FILE:-}"
 TEMP_DIR=""
+
+SITE_NONCE=""
+SITE_HUE=""
+SITE_GRID_SIZE=""
+SITE_TITLE=""
+SITE_RAIL=""
+SITE_EYEBROW=""
+SITE_HEADING=""
+SITE_SUMMARY=""
+SITE_STATE=""
+
+declare -a ROLLBACK_TARGETS=()
+declare -a ROLLBACK_BACKUPS=()
+ROLLBACK_ACTIVE=false
+EDGE_WAS_ACTIVE=false
+EDGE_WAS_ENABLED=false
+NGINX_WAS_ACTIVE=false
+NGINX_WAS_ENABLED=false
+TUNNEL_WAS_ACTIVE=false
+TUNNEL_WAS_ENABLED=false
 
 info() {
   printf '%b\n' "${COLOR_CYAN}$*${COLOR_RESET}"
@@ -51,6 +72,7 @@ warn() {
 
 die() {
   printf '%b\n' "${COLOR_RED}错误: $*${COLOR_RESET}" >&2
+  rollback_installation
   exit 1
 }
 
@@ -65,6 +87,7 @@ cleanup() {
 on_error() {
   local exit_code=$?
   printf '%b\n' "${COLOR_RED}安装在第 ${BASH_LINENO[0]} 行失败（退出码: ${exit_code}）。${COLOR_RESET}" >&2
+  rollback_installation
   exit "$exit_code"
 }
 
@@ -120,6 +143,31 @@ generate_uuid() {
   else
     die "无法生成 UUID，请安装 uuidgen。"
   fi
+}
+
+prepare_site_profile() {
+  local selector
+  local -a labels=("Service desk" "Project space" "Public workspace" "Documentation")
+  local -a eyebrows=("Service availability" "Workspace status" "Public service" "Site status")
+  local -a headings=("Available now." "Service online." "Welcome." "Everything is ready.")
+  local -a summaries=(
+    "此站点用于提供公开资料与服务信息，计划维护和状态变化会在这里更新。"
+    "这里发布项目说明与公共内容。如有计划维护，相关通知会在本页面更新。"
+    "公开页面当前可正常访问。服务信息和维护公告将在这里发布。"
+    "此页面承载公开内容与状态信息，必要的维护通知会提前更新。"
+  )
+  local -a states=("Available" "Operational" "Online" "Ready")
+
+  SITE_NONCE=$(random_hex 12)
+  selector=$((16#${SITE_NONCE:0:2}))
+  SITE_HUE=$((16#${SITE_NONCE:2:4} % 321))
+  SITE_GRID_SIZE=$(printf '%d.%d' "$((4 + selector % 2))" "$((selector % 9))")
+  SITE_TITLE="${PUBLIC_DOMAIN} - ${labels[selector % ${#labels[@]}]}"
+  SITE_RAIL="${PUBLIC_DOMAIN} / ${labels[(selector + 1) % ${#labels[@]}]}"
+  SITE_EYEBROW=${eyebrows[(selector + 2) % ${#eyebrows[@]}]}
+  SITE_HEADING=${headings[(selector + 3) % ${#headings[@]}]}
+  SITE_SUMMARY=${summaries[selector % ${#summaries[@]}]}
+  SITE_STATE=${states[(selector + 1) % ${#states[@]}]}
 }
 
 validate_uuid() {
@@ -221,6 +269,10 @@ collect_configuration() {
   read_value PUBLIC_DOMAIN "公网域名"
   validate_domain "$PUBLIC_DOMAIN" || die "公网域名格式无效。"
 
+  if [[ -n "$SITE_INDEX_FILE" ]]; then
+    [[ -s $SITE_INDEX_FILE ]] || die "SITE_INDEX_FILE 不存在或为空。"
+  fi
+
   read_value DEPLOY_MODE "部署模式（tunnel/direct）" "tunnel"
   DEPLOY_MODE=${DEPLOY_MODE,,}
   [[ $DEPLOY_MODE == "tunnel" || $DEPLOY_MODE == "direct" ]] || die "部署模式只能是 tunnel 或 direct。"
@@ -231,7 +283,7 @@ collect_configuration() {
   validate_uuid "$CUSTOM_UUID" || die "UUID 格式无效。"
 
   if [[ -z "$WS_PATH" ]]; then
-    WS_PATH="/api/events/$(random_hex 16)"
+    WS_PATH="/$(random_hex 12)/$(random_hex 16)"
   fi
   validate_ws_path "$WS_PATH" || die "WS_PATH 必须是 16-120 位安全路径，且不能以 / 结尾。"
 
@@ -279,13 +331,91 @@ create_service_user() {
   fi
 }
 
+capture_service_state() {
+  systemctl is-active --quiet "$SERVICE_NAME" && EDGE_WAS_ACTIVE=true || true
+  systemctl is-enabled --quiet "$SERVICE_NAME" && EDGE_WAS_ENABLED=true || true
+  systemctl is-active --quiet nginx && NGINX_WAS_ACTIVE=true || true
+  systemctl is-enabled --quiet nginx && NGINX_WAS_ENABLED=true || true
+  systemctl is-active --quiet "$TUNNEL_SERVICE_NAME" && TUNNEL_WAS_ACTIVE=true || true
+  systemctl is-enabled --quiet "$TUNNEL_SERVICE_NAME" && TUNNEL_WAS_ENABLED=true || true
+}
+
+restore_service_state() {
+  local unit=$1
+  local was_active=$2
+  local was_enabled=$3
+
+  if systemctl cat "$unit" >/dev/null 2>&1; then
+    if [[ $was_enabled == "true" ]]; then
+      systemctl enable "$unit" >/dev/null 2>&1 || true
+    else
+      systemctl disable "$unit" >/dev/null 2>&1 || true
+    fi
+
+    if [[ $was_active == "true" ]]; then
+      systemctl restart "$unit" >/dev/null 2>&1 || true
+    else
+      systemctl stop "$unit" >/dev/null 2>&1 || true
+    fi
+  else
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  fi
+}
+
+rollback_installation() {
+  local index target backup
+
+  [[ $ROLLBACK_ACTIVE == "true" ]] || return 0
+  ROLLBACK_ACTIVE=false
+  trap - ERR
+  set +e
+  warn "正在恢复本次安装前的配置……"
+
+  for ((index = ${#ROLLBACK_TARGETS[@]} - 1; index >= 0; index--)); do
+    target=${ROLLBACK_TARGETS[index]}
+    backup=${ROLLBACK_BACKUPS[index]}
+    if [[ -n $backup && -e $backup ]]; then
+      rm -f -- "$target"
+      cp --archive --no-dereference "$backup" "$target"
+    else
+      rm -f -- "$target"
+    fi
+  done
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  restore_service_state "$SERVICE_NAME" "$EDGE_WAS_ACTIVE" "$EDGE_WAS_ENABLED"
+  restore_service_state nginx "$NGINX_WAS_ACTIVE" "$NGINX_WAS_ENABLED"
+  restore_service_state "$TUNNEL_SERVICE_NAME" "$TUNNEL_WAS_ACTIVE" "$TUNNEL_WAS_ENABLED"
+  warn "已尝试恢复原配置和服务状态；备份文件仍保留在原目录。"
+}
+
 backup_file() {
   local path=$1
-  local stamp
+  local stamp backup=""
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
 
   if [[ -e $path || -L $path ]]; then
-    cp --archive --no-dereference "$path" "${path}.bak.${stamp}"
+    backup="${path}.bak.${stamp}"
+    cp --archive --no-dereference "$path" "$backup"
+  fi
+
+  ROLLBACK_TARGETS+=("$path")
+  ROLLBACK_BACKUPS+=("$backup")
+  ROLLBACK_ACTIVE=true
+}
+
+install_managed_file() {
+  local owner=$1
+  local group=$2
+  local mode=$3
+  local source=$4
+  local destination=$5
+
+  if [[ -e $destination && $source -ef $destination ]]; then
+    chown "$owner:$group" "$destination"
+    chmod "$mode" "$destination"
+  else
+    install -o "$owner" -g "$group" -m "$mode" "$source" "$destination"
   fi
 }
 
@@ -310,6 +440,7 @@ install_sing_box() {
   [[ -f $source_bin ]] || die "发布包结构不符合预期。"
 
   install -d -m 0755 "$(dirname "$SING_BOX_BIN")"
+  backup_file "$SING_BOX_BIN"
   install -o root -g root -m 0755 "$source_bin" "$SING_BOX_BIN"
   success "sing-box 官方发布包校验并安装完成。"
 }
@@ -331,16 +462,38 @@ render_file() {
     -e "s|{{CONFIG_PATH}}|${CONFIG_PATH}|g" \
     -e "s|{{CLOUDFLARED_BIN}}|${CLOUDFLARED_BIN}|g" \
     -e "s|{{TOKEN_FILE}}|${TOKEN_PATH}|g" \
+    -e "s|{{SITE_NONCE}}|${SITE_NONCE}|g" \
+    -e "s|{{SITE_HUE}}|${SITE_HUE}|g" \
+    -e "s|{{SITE_GRID_SIZE}}|${SITE_GRID_SIZE}|g" \
+    -e "s|{{SITE_TITLE}}|${SITE_TITLE}|g" \
+    -e "s|{{SITE_RAIL}}|${SITE_RAIL}|g" \
+    -e "s|{{SITE_EYEBROW}}|${SITE_EYEBROW}|g" \
+    -e "s|{{SITE_HEADING}}|${SITE_HEADING}|g" \
+    -e "s|{{SITE_SUMMARY}}|${SITE_SUMMARY}|g" \
+    -e "s|{{SITE_STATE}}|${SITE_STATE}|g" \
     "$template" >"$destination"
 }
 
+render_site() {
+  local destination=$1
+
+  if [[ -n "$SITE_INDEX_FILE" ]]; then
+    cp -- "$SITE_INDEX_FILE" "$destination"
+  else
+    prepare_site_profile
+    render_file "${TEMPLATE_DIR}/index.html" "$destination"
+    ! grep -Eq '\{\{SITE_[A-Z_]+\}\}' "$destination" || die "伪装页模板渲染不完整。"
+  fi
+}
+
 write_configuration() {
-  local nginx_template rendered_config rendered_nginx rendered_service rendered_tunnel
+  local nginx_template rendered_config rendered_nginx rendered_service rendered_site rendered_tunnel
 
   TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
   rendered_config="${TEMP_DIR}/config.json"
   rendered_nginx="${TEMP_DIR}/nginx.conf"
   rendered_service="${TEMP_DIR}/edge-router.service"
+  rendered_site="${TEMP_DIR}/index.html"
   rendered_tunnel="${TEMP_DIR}/edge-tunnel.service"
 
   render_file "${TEMPLATE_DIR}/sing-box.json.tpl" "$rendered_config"
@@ -351,27 +504,32 @@ write_configuration() {
   fi
   render_file "$nginx_template" "$rendered_nginx"
   render_file "${TEMPLATE_DIR}/edge-router.service.tpl" "$rendered_service"
+  render_site "$rendered_site"
 
   "$SING_BOX_BIN" check -c "$rendered_config"
 
   install -d -o root -g edge-router -m 0750 "$CONFIG_DIR"
   install -d -o root -g root -m 0755 "$SITE_ROOT"
   install -d -o root -g root -m 0755 "$(dirname "$NGINX_CONFIG")"
-  install -o root -g root -m 0644 "${TEMPLATE_DIR}/index.html" "${SITE_ROOT}/index.html"
 
   backup_file "$CONFIG_PATH"
   backup_file "$NGINX_CONFIG"
+  backup_file "${SITE_ROOT}/index.html"
   backup_file "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
   install -o root -g edge-router -m 0640 "$rendered_config" "$CONFIG_PATH"
   install -o root -g root -m 0644 "$rendered_nginx" "$NGINX_CONFIG"
+  install -o root -g root -m 0644 "$rendered_site" "${SITE_ROOT}/index.html"
   install -o root -g root -m 0644 "$rendered_service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 
   if [[ $DEPLOY_MODE == "direct" ]]; then
     install -d -o root -g root -m 0700 "${CONFIG_DIR}/tls"
-    install -o root -g root -m 0600 "$TLS_CERT_FILE" "$TLS_CERT_PATH"
-    install -o root -g root -m 0600 "$TLS_KEY_FILE" "$TLS_KEY_PATH"
+    backup_file "$TLS_CERT_PATH"
+    backup_file "$TLS_KEY_PATH"
+    install_managed_file root root 0600 "$TLS_CERT_FILE" "$TLS_CERT_PATH"
+    install_managed_file root root 0600 "$TLS_KEY_FILE" "$TLS_KEY_PATH"
   else
-    install -o edge-router -g edge-router -m 0400 "$TUNNEL_TOKEN_FILE" "$TOKEN_PATH"
+    backup_file "$TOKEN_PATH"
+    install_managed_file edge-router edge-router 0400 "$TUNNEL_TOKEN_FILE" "$TOKEN_PATH"
     render_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl" "$rendered_tunnel"
     backup_file "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
     install -o root -g root -m 0644 "$rendered_tunnel" "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
@@ -382,10 +540,25 @@ write_client_link() {
   local client_json encoded_link
 
   client_json=$(printf \
-    '{"v":"2","ps":"application-edge","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","fp":"chrome"}' \
-    "$PUBLIC_DOMAIN" "$CUSTOM_UUID" "$PUBLIC_DOMAIN" "$WS_PATH" "$PUBLIC_DOMAIN")
+    '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","fp":"chrome"}' \
+    "$PUBLIC_DOMAIN" "$PUBLIC_DOMAIN" "$CUSTOM_UUID" "$PUBLIC_DOMAIN" "$WS_PATH" "$PUBLIC_DOMAIN")
   encoded_link=$(printf '%s' "$client_json" | base64 | tr -d '\r\n')
+  backup_file "$CLIENT_PATH"
   printf 'vmess://%s\n' "$encoded_link" | install -o root -g root -m 0600 /dev/stdin "$CLIENT_PATH"
+}
+
+check_local_site() {
+  local status
+
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+      --max-time 10 --header "Host: ${PUBLIC_DOMAIN}" "http://127.0.0.1:${ORIGIN_PORT}/")
+  else
+    status=$(curl --silent --show-error --insecure --output /dev/null --write-out '%{http_code}' \
+      --max-time 10 --resolve "${PUBLIC_DOMAIN}:443:127.0.0.1" "https://${PUBLIC_DOMAIN}/")
+  fi
+
+  [[ $status == "200" ]] || die "本地站点健康检查失败，HTTP 状态码: ${status}。"
 }
 
 activate_services() {
@@ -404,12 +577,18 @@ activate_services() {
   fi
 
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME"
-  systemctl enable --now nginx
-  systemctl reload nginx
+  systemctl enable "$SERVICE_NAME" nginx >/dev/null
+  systemctl restart "$SERVICE_NAME"
+
+  if systemctl is-active --quiet nginx; then
+    systemctl reload nginx
+  else
+    systemctl start nginx
+  fi
 
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
-    systemctl enable --now "$TUNNEL_SERVICE_NAME"
+    systemctl enable "$TUNNEL_SERVICE_NAME" >/dev/null
+    systemctl restart "$TUNNEL_SERVICE_NAME"
   else
     systemctl disable --now "$TUNNEL_SERVICE_NAME" >/dev/null 2>&1 || true
   fi
@@ -419,6 +598,9 @@ activate_services() {
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
     systemctl is-active --quiet "$TUNNEL_SERVICE_NAME" || die "${TUNNEL_SERVICE_NAME} 未成功启动。"
   fi
+
+  check_local_site
+  ROLLBACK_ACTIVE=false
 }
 
 show_summary() {
@@ -440,6 +622,7 @@ main() {
   ((EUID == 0)) || die "请使用 sudo 运行此脚本。"
   [[ $(uname -s) == "Linux" ]] || die "仅支持 Linux。"
   command -v systemctl >/dev/null 2>&1 || die "当前系统不使用 systemd。"
+  capture_service_state
 
   require_file "${TEMPLATE_DIR}/sing-box.json.tpl"
   require_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl"

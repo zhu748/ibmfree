@@ -24,8 +24,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: "1.26.x"
-          check-latest: true
+          go-version: "1.26.7"
+          check-latest: false
           cache: false
 
       - name: Build pinned upstream source
@@ -34,7 +34,8 @@ jobs:
       - name: Inspect artifact
         run: |
           file dist/cloudflared-linux-s390x
-          sha256sum --check dist/cloudflared-linux-s390x.sha256
+          (cd dist && sha256sum --check cloudflared-linux-s390x.sha256)
+          cat dist/cloudflared-linux-s390x.manifest
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -43,5 +44,6 @@ jobs:
           path: |
             dist/cloudflared-linux-s390x
             dist/cloudflared-linux-s390x.sha256
+            dist/cloudflared-linux-s390x.manifest
           if-no-files-found: error
           retention-days: 14

@@ -18,9 +18,7 @@
       ],
       "transport": {
         "type": "ws",
-        "path": "{{WS_PATH}}",
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
+        "path": "{{WS_PATH}}"
       }
     }
   ],

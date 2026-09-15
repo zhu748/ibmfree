@@ -19,6 +19,7 @@ readonly TLS_KEY_PATH="${CONFIG_DIR}/tls/origin.key"
 readonly SING_BOX_BIN="/usr/local/libexec/edge-router"
 readonly SITE_ROOT="/var/www/edge-router"
 readonly BACKUP_ROOT="/var/backups/edge-router"
+readonly INSTALL_LOCK_PATH="/run/edge-router-install.lock"
 readonly NGINX_CONFIG="/etc/nginx/conf.d/edge-router.conf"
 readonly SYSTEMD_DIR="/etc/systemd/system"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,6 +44,7 @@ CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-}"
 SITE_INDEX_FILE="${SITE_INDEX_FILE:-}"
 TEMP_DIR=""
 BACKUP_DIR=""
+INSTALL_LOCK_FD=""
 
 SITE_NONCE=""
 SITE_HUE=""
@@ -114,6 +116,48 @@ trap 'exit 143' TERM
 
 require_file() {
   [[ -f $1 ]] || die "缺少仓库文件: $1。请克隆完整仓库后运行，不要使用 curl | bash。"
+}
+
+preflight_environment() {
+  local manager_version=""
+  command -v systemctl >/dev/null 2>&1 || die "当前系统不使用 systemd。"
+  manager_version=$(systemctl show --property=Version --value 2>/dev/null) || \
+    die "无法连接 systemd 系统管理器；请在正常启动 systemd 的 VPS 上运行。"
+  [[ -n $manager_version ]] || die "无法读取 systemd 系统管理器状态。"
+}
+
+acquire_install_lock() {
+  command -v flock >/dev/null 2>&1 || die "缺少 flock，请先安装系统基础包 util-linux。"
+  [[ ! -L $INSTALL_LOCK_PATH ]] || die "安装锁不能是符号链接: ${INSTALL_LOCK_PATH}"
+  [[ ! -e $INSTALL_LOCK_PATH || -f $INSTALL_LOCK_PATH ]] || die "安装锁路径不是普通文件: ${INSTALL_LOCK_PATH}"
+  exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_PATH"
+  flock --nonblock "$INSTALL_LOCK_FD" || die "另一个安装进程正在运行，或无法取得安装锁；请等待它结束后重试。"
+  # Keep the inode in place; the descriptor releases the lock after exit/rollback.
+}
+
+assert_port_compatible() {
+  local port=$1 unit=$2 listeners="" main_pid="" listener=""
+  listeners=$(ss -H -lntp "sport = :${port}" 2>/dev/null) || \
+    die "无法检查 TCP ${port} 的占用情况，已停止安装。"
+  [[ -n $listeners ]] || return 0
+
+  main_pid=$(systemctl show "$unit" --property=MainPID --value 2>/dev/null) || \
+    die "TCP ${port} 已被占用，无法确认是否属于 ${unit}；未停止任何服务。"
+  [[ $main_pid =~ ^[1-9][0-9]*$ ]] || \
+    die "TCP ${port} 已被其他进程占用；请先检查监听服务，安装器不会自动结束进程或改端口。"
+  while IFS= read -r listener; do
+    [[ $listener == *"pid=${main_pid},"* ]] || \
+      die "TCP ${port} 存在不属于 ${unit} 的监听进程；请先检查，安装器不会自动结束进程或改端口。"
+  done <<<"$listeners"
+}
+
+preflight_ports() {
+  assert_port_compatible "$SING_BOX_PORT" "$SERVICE_NAME"
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    assert_port_compatible "$ORIGIN_PORT" nginx
+  else
+    assert_port_compatible 443 nginx
+  fi
 }
 
 read_value() {
@@ -206,11 +250,14 @@ validate_ws_path() {
 
 choose_internal_port() {
   local candidate=""
+  local listeners=""
   local attempts=0
 
+  listeners=$(ss -H -lnt 2>/dev/null) || die "无法读取 TCP 监听状态，不能安全选择内部端口。"
   while ((attempts < 100)); do
     candidate=$((20000 + (((RANDOM << 1) ^ RANDOM) % 20000)))
-    if ! ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$candidate$"; then
+    if [[ $candidate != "$ORIGIN_PORT" ]] &&
+      ! awk -v port="$candidate" '$4 ~ (":" port "$") { found = 1 } END { exit !found }' <<<"$listeners"; then
       printf '%s' "$candidate"
       return 0
     fi
@@ -807,7 +854,8 @@ show_summary() {
 main() {
   ((EUID == 0)) || die "请使用 sudo 运行此脚本。"
   [[ $(uname -s) == "Linux" ]] || die "仅支持 Linux。"
-  command -v systemctl >/dev/null 2>&1 || die "当前系统不使用 systemd。"
+  preflight_environment
+  acquire_install_lock
   capture_service_state
 
   require_file "${TEMPLATE_DIR}/sing-box.json.tpl"
@@ -819,6 +867,7 @@ main() {
 
   install_packages
   collect_configuration
+  preflight_ports
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
     ensure_cloudflared
   fi

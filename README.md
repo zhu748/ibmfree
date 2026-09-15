@@ -51,6 +51,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstra
 
 安装器只会要求 UUID（可留空自动生成）、公网域名和 Cloudflare Tunnel Token。完成后会直接打印 `vmess://` 链接。重复安装时会复用现有 UUID、WebSocket 路径和内部端口，避免旧客户端无故失效。引导脚本会下载完整仓库归档，正式安装仍由仓库中的模板化安装器执行。
 
+安装前会确认 systemd 系统管理器可连接，并通过 `flock` 防止两个安装进程同时修改配置（系统基础包 `util-linux` 提供该命令）。锁会覆盖安装和回滚过程，进程结束后释放；不要手动删除 `/run/edge-router-install.lock` 来强行解锁。
+
+完成依赖安装和参数收集后，安装器会检查内部核心端口及 Tunnel 的 8001（Direct 为 443）是否空闲或属于对应的现有 systemd 服务；其他进程占用或无法确认归属时，在部署文件写入前停止，不会结束占用进程或悄悄改端口。检查保守地覆盖同端口的所有本机地址；检查后仍可能有其他程序抢占端口，因此保留后续服务验证和回滚。此时基础软件包可能已经安装。
+
 重复安装时，UUID 提示中的默认值来自本安装器已有配置，回车即可保留；显式传入 `UUID`、`WS_PATH`、`SING_BOX_PORT` 时以传入值为准。已有配置为空或无法唯一读取时，安装器停止而不会静默生成新身份；此时请先检查并备份 `/etc/edge-router/config.json`。这不等同于自动迁移其他脚本生成的配置。
 
 安装后会检查本地首页和 Nginx 到 sing-box 的 WebSocket 握手，并有限重试以等待服务就绪。本地通过不代表 Cloudflare Token、域名映射或 VMess 认证已经通过公网验证；最终仍需导入链接测试。健康检查不使用环境代理，也不会把 Token 放进请求。
@@ -125,7 +129,7 @@ curl -I https://edge.example.com/
 bash tests/run.sh
 ```
 
-Windows 可使用 Git Bash 在仓库目录执行相同命令。`Test installer` 工作流会在安装器、模板或测试变更时于 Ubuntu 24.04 运行测试；这不能替代 s390x/systemd VPS 上的完整安装验证。
+Windows 可使用 Git Bash 在仓库目录执行相同命令；实际 `flock` 互斥和 `ss` 进程归属测试只在 Linux 运行，其余预检分支使用隔离模拟。`Test installer` 工作流会在安装器、模板或测试变更时于 Ubuntu 24.04 运行测试；这不能替代 s390x/systemd VPS 上的完整安装验证。
 
 CI 还会安装 Nginx 并执行 `node tests/nginx-privacy.cjs`：使用测试专属临时目录、回环端口和一次性证书，实际验证 Tunnel/Direct 模板的 404、备份拒绝访问、日志字段、目录跳转、SNI 拒绝和有效 WebSocket 升级。该步骤在开发机需要预装 Nginx 与 OpenSSL，不会修改系统 Nginx 配置。
 

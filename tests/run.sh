@@ -13,6 +13,7 @@ load_installer() {
     -e 's|^readonly CONFIG_DIR=.*|readonly CONFIG_DIR="${TEST_ROOT}/config"|' \
     -e 's|^readonly SITE_ROOT=.*|readonly SITE_ROOT="${TEST_ROOT}/site"|' \
     -e 's|^readonly BACKUP_ROOT=.*|readonly BACKUP_ROOT="${TEST_ROOT}/backups"|' \
+    -e 's|^readonly INSTALL_LOCK_PATH=.*|readonly INSTALL_LOCK_PATH="${TEST_ROOT}/install.lock"|' \
     -e 's|^readonly NGINX_CONFIG=.*|readonly NGINX_CONFIG="${TEST_ROOT}/nginx.conf"|' \
     -e 's|^readonly SYSTEMD_DIR=.*|readonly SYSTEMD_DIR="${TEST_ROOT}/units"|' \
     -e 's|^readonly SING_BOX_BIN=.*|readonly SING_BOX_BIN="${TEST_ROOT}/edge-router"|' \
@@ -36,7 +37,10 @@ load_installer() {
   printf 'test-only-token' >"$TUNNEL_TOKEN_FILE"
 
   generate_uuid() { printf '11111111-1111-4111-8111-111111111111'; }
-  choose_internal_port() { printf '23456'; }
+  if [[ ${2-} != test_choose_port_* ]]; then
+    choose_internal_port() { printf '23456'; }
+  fi
+  ss() { fail 'unexpected host socket inspection'; }
   systemctl() { fail 'unexpected systemctl call'; }
   install() { fail 'unexpected host installation'; }
   download_file() { fail 'unexpected network download'; }
@@ -131,6 +135,167 @@ test_same_port() {
   if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then
     fail 'numerically identical ports accepted'
   fi
+}
+
+test_systemd_available() {
+  systemctl() {
+    assert_equal "$*" 'show --property=Version --value'
+    printf '255.4-1ubuntu8.11\n'
+  }
+  preflight_environment
+}
+
+test_systemd_unavailable() {
+  systemctl() { return 1; }
+  if (preflight_environment) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'unreachable systemd manager accepted'
+  fi
+  grep -q '无法连接 systemd' "${TEST_ROOT}/error"
+  systemctl() { :; }
+  if (preflight_environment) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'empty systemd manager property accepted'
+  fi
+  grep -q '无法读取 systemd' "${TEST_ROOT}/error"
+}
+
+test_install_lock_failure() {
+  flock() { assert_equal "$1" --nonblock; return 1; }
+  if (acquire_install_lock) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'failed installation lock accepted'
+  fi
+  grep -q '无法取得安装锁' "${TEST_ROOT}/error"
+}
+
+test_install_lock_real() {
+  if [[ $(uname -s) != Linux ]]; then
+    printf 'SKIP: real flock semantics require Linux (covered by CI)\n'
+    return 77
+  fi
+  acquire_install_lock
+  if (
+    exec {INSTALL_LOCK_FD}>&-
+    acquire_install_lock
+  ) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'second installer acquired a held lock'
+  fi
+  grep -q '无法取得安装锁' "${TEST_ROOT}/error"
+  exec {INSTALL_LOCK_FD}>&-
+  acquire_install_lock
+  exec {INSTALL_LOCK_FD}>&-
+  [[ -f $INSTALL_LOCK_PATH ]] || fail 'lock inode removed on release'
+  mv "$INSTALL_LOCK_PATH" "${TEST_ROOT}/other.lock"
+  ln -s "${TEST_ROOT}/other.lock" "$INSTALL_LOCK_PATH"
+  if (acquire_install_lock) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'symbolic link accepted as installation lock'
+  fi
+  grep -q '安装锁不能是符号链接' "${TEST_ROOT}/error"
+}
+
+mock_listeners() {
+  ss() {
+    assert_equal "$1 $2" '-H -lntp'
+    assert_equal "$3" 'sport = :8001'
+    printf '%s' "${MOCK_LISTENERS:-}"
+    return "${MOCK_SS_STATUS:-0}"
+  }
+  systemctl() {
+    assert_equal "$*" 'show nginx --property=MainPID --value'
+    printf '%s' "${MOCK_MAIN_PID:-123}"
+    return "${MOCK_SYSTEMCTL_STATUS:-0}"
+  }
+}
+
+test_port_preflight_free() {
+  mock_listeners
+  systemctl() { fail 'unused port queried a service PID'; }
+  assert_port_compatible 8001 nginx
+}
+
+test_port_preflight_owned() {
+  mock_listeners
+  MOCK_LISTENERS='LISTEN 0 511 127.0.0.1:8001 0.0.0.0:* users:(("nginx",pid=124,fd=8),("nginx",pid=123,fd=8))'
+  assert_port_compatible 8001 nginx
+  MOCK_LISTENERS+=$'\nLISTEN 0 511 [::1]:8001 [::]:* users:(("nginx",pid=123,fd=9))'
+  assert_port_compatible 8001 nginx
+}
+
+test_port_preflight_conflicts() {
+  mock_listeners
+  local listener
+  for listener in \
+    'LISTEN 0 511 127.0.0.1:8001 0.0.0.0:* users:(("nginx",pid=1234,fd=8))' \
+    'LISTEN 0 511 127.0.0.1:8001 0.0.0.0:*' \
+    $'LISTEN 0 511 127.0.0.1:8001 0.0.0.0:* users:(("nginx",pid=123,fd=8))\nLISTEN 0 511 [::1]:8001 [::]:* users:(("other",pid=789,fd=9))'; do
+    MOCK_LISTENERS=$listener
+    if (assert_port_compatible 8001 nginx) >"${TEST_ROOT}/error" 2>&1; then
+      fail 'foreign or unidentified listener accepted'
+    fi
+    grep -q '不属于 nginx' "${TEST_ROOT}/error"
+  done
+}
+
+test_port_preflight_errors() {
+  mock_listeners
+  MOCK_SS_STATUS=1
+  if (assert_port_compatible 8001 nginx) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'failed socket inspection treated as free port'
+  fi
+  grep -q '无法检查 TCP 8001' "${TEST_ROOT}/error"
+  MOCK_SS_STATUS=0
+  MOCK_LISTENERS='LISTEN 0 511 127.0.0.1:8001 0.0.0.0:* users:(("other",pid=123,fd=8))'
+  MOCK_SYSTEMCTL_STATUS=1
+  if (assert_port_compatible 8001 nginx) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'failed service inspection accepted'
+  fi
+  grep -q '无法确认是否属于 nginx' "${TEST_ROOT}/error"
+  MOCK_SYSTEMCTL_STATUS=0
+  for MOCK_MAIN_PID in 0 unknown; do
+    if (assert_port_compatible 8001 nginx) >"${TEST_ROOT}/error" 2>&1; then
+      fail 'invalid service PID accepted'
+    fi
+    grep -q '已被其他进程占用' "${TEST_ROOT}/error"
+  done
+}
+
+test_port_preflight_modes() {
+  SING_BOX_PORT=23456
+  assert_port_compatible() { printf '%s %s\n' "$1" "$2" >>"${TEST_ROOT}/ports"; }
+  preflight_ports
+  assert_equal "$(<"${TEST_ROOT}/ports")" $'23456 edge-router\n8001 nginx'
+  : >"${TEST_ROOT}/ports"
+  DEPLOY_MODE=direct
+  preflight_ports
+  assert_equal "$(<"${TEST_ROOT}/ports")" $'23456 edge-router\n443 nginx'
+}
+
+test_choose_port_free() {
+  ss() { assert_equal "$*" '-H -lnt'; }
+  local selected
+  selected=$(choose_internal_port)
+  validate_port "$selected"
+  ((selected >= 20000 && selected < 40000))
+  [[ $selected != "$ORIGIN_PORT" ]]
+}
+
+test_choose_port_failure() {
+  ss() { return 1; }
+  if (choose_internal_port) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'random port chosen after socket inspection failure'
+  fi
+  grep -q '无法读取 TCP 监听状态' "${TEST_ROOT}/error"
+}
+
+test_choose_port_exhausted() {
+  ss() {
+    local port
+    for ((port = 20000; port < 40000; port++)); do
+      printf 'LISTEN 0 511 127.0.0.1:%s 0.0.0.0:*\n' "$port"
+    done
+  }
+  if (choose_internal_port) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'occupied port chosen after retry limit'
+  fi
+  grep -q '无法选择空闲的内部端口' "${TEST_ROOT}/error"
 }
 
 test_large_cloudflared_help() {
@@ -359,6 +524,34 @@ test_real_http() {
   check_local_site
 }
 
+test_real_socket_preflight() {
+  if [[ $(uname -s) != Linux ]]; then
+    printf 'SKIP: real ss process inspection requires Linux (covered by CI)\n'
+    return 77
+  fi
+  local pid attempt port
+  node "${REPO_ROOT}/tests/http-server.cjs" "${TEST_ROOT}/port" >"${TEST_ROOT}/server.log" 2>&1 &
+  pid=$!
+  trap "kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true" EXIT
+  for attempt in 1 2 3 4 5; do
+    [[ -s ${TEST_ROOT}/port ]] && break
+    command sleep 1
+  done
+  [[ -s ${TEST_ROOT}/port ]] || fail 'loopback server did not start'
+  port=$(<"${TEST_ROOT}/port")
+  unset -f ss
+  systemctl() {
+    assert_equal "$*" 'show nginx --property=MainPID --value'
+    printf '%s' "$pid"
+  }
+  assert_port_compatible "$port" nginx
+  systemctl() { printf '0'; }
+  if (assert_port_compatible "$port" nginx) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'real socket owned by another process accepted'
+  fi
+  grep -q '已被其他进程占用' "${TEST_ROOT}/error"
+}
+
 load_bootstrap() {
   source "${REPO_ROOT}/bootstrap.sh"
   trap - EXIT
@@ -404,7 +597,7 @@ test_bootstrap_bad_archive() {
 
 if [[ ${1-} == --case ]]; then
   readonly TEST_ROOT=$3
-  load_installer
+  load_installer "$@"
   "$2"
   exit 0
 fi
@@ -420,24 +613,36 @@ cleanup_tests() {
 trap cleanup_tests EXIT
 
 failures=0
+skipped=0
 count=0
 for test in test_first_install test_repeat_install test_explicit_values test_invalid_config \
   test_empty_config test_ambiguous_config test_three_inputs test_port_validation test_same_port \
+  test_systemd_available test_systemd_unavailable test_install_lock_failure test_install_lock_real \
+  test_port_preflight_free test_port_preflight_owned test_port_preflight_conflicts \
+  test_port_preflight_errors test_port_preflight_modes \
+  test_choose_port_free test_choose_port_failure test_choose_port_exhausted \
   test_large_cloudflared_help test_broken_cloudflared test_websocket_upgrade \
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \
   test_backup_once test_site_preserved test_site_no_deployment_marker test_site_backup_private \
   test_missing_backup test_atomic_restore_copy_failure test_rollback_restores_files \
   test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link \
-  test_real_http test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do
+  test_real_http test_real_socket_preflight \
+  test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do
   ((count += 1))
   mkdir "${TEST_ROOT}/${test}"
   if bash "$SELF" --case "$test" "${TEST_ROOT}/${test}" >"${TEST_ROOT}/${test}.log" 2>&1; then
     printf 'PASS %s\n' "$test"
   else
+    status=$?
     cat "${TEST_ROOT}/${test}.log"
-    printf 'FAIL %s\n' "$test"
-    ((failures += 1))
+    if ((status == 77)); then
+      printf 'SKIP %s\n' "$test"
+      ((skipped += 1))
+    else
+      printf 'FAIL %s\n' "$test"
+      ((failures += 1))
+    fi
   fi
 done
-printf '%s tests, %s failures\n' "$count" "$failures"
+printf '%s tests, %s failures, %s skipped\n' "$count" "$failures" "$skipped"
 ((failures == 0))

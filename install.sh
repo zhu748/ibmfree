@@ -18,6 +18,7 @@ readonly TLS_CERT_PATH="${CONFIG_DIR}/tls/origin.crt"
 readonly TLS_KEY_PATH="${CONFIG_DIR}/tls/origin.key"
 readonly SING_BOX_BIN="/usr/local/libexec/edge-router"
 readonly SITE_ROOT="/var/www/edge-router"
+readonly BACKUP_ROOT="/var/backups/edge-router"
 readonly NGINX_CONFIG="/etc/nginx/conf.d/edge-router.conf"
 readonly SYSTEMD_DIR="/etc/systemd/system"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +42,7 @@ TUNNEL_TOKEN_FILE="${TUNNEL_TOKEN_FILE:-}"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-}"
 SITE_INDEX_FILE="${SITE_INDEX_FILE:-}"
 TEMP_DIR=""
+BACKUP_DIR=""
 
 SITE_NONCE=""
 SITE_HUE=""
@@ -513,22 +515,27 @@ rollback_installation() {
   if ((failed)); then
     warn "部分文件未能回滚，请根据上方路径手动检查；已尝试恢复服务状态。"
   else
-    warn "配置文件已恢复；已尝试恢复原服务状态，备份文件仍保留在原目录。"
+    warn "配置文件已恢复；已尝试恢复原服务状态，备份文件保留在 ${BACKUP_ROOT}。"
   fi
   return "$failed"
 }
 
 backup_file() {
   local path=$1
-  local stamp backup="" existing_target
+  local backup="" existing_target
   for existing_target in "${ROLLBACK_TARGETS[@]}"; do
     [[ $existing_target != "$path" ]] || return 0
   done
-  stamp=$(date -u +%Y%m%dT%H%M%SZ)
-
   if [[ -e $path || -L $path ]]; then
-    backup="${path}.bak.${stamp}.$$"
-    cp --archive --no-dereference "$path" "$backup"
+    if [[ -z $BACKUP_DIR ]]; then
+      [[ ! -L $BACKUP_ROOT ]] || die "备份目录不能是符号链接: ${BACKUP_ROOT}"
+      mkdir -p -m 0700 "$BACKUP_ROOT"
+      chmod 0700 "$BACKUP_ROOT"
+      BACKUP_DIR=$(mktemp -d "${BACKUP_ROOT}/install.XXXXXXXX")
+    fi
+    backup=$(mktemp "${BACKUP_DIR}/file.XXXXXXXX")
+    cp --archive --no-dereference --remove-destination "$path" "$backup"
+    printf '%s\t%s\n' "$backup" "$path" >>"${BACKUP_DIR}/paths.tsv"
   fi
 
   ROLLBACK_TARGETS+=("$path")
@@ -611,6 +618,8 @@ render_site() {
 
   if [[ -n "$SITE_INDEX_FILE" ]]; then
     cp -- "$SITE_INDEX_FILE" "$destination"
+  elif [[ -s ${SITE_ROOT}/index.html ]]; then
+    cp -- "${SITE_ROOT}/index.html" "$destination"
   else
     prepare_site_profile
     render_file "${TEMPLATE_DIR}/index.html" "$destination"
@@ -780,6 +789,9 @@ show_summary() {
   printf '  模式: %s\n' "$DEPLOY_MODE"
   printf '  客户端配置: %s（仅 root 可读）\n' "$CLIENT_PATH"
   printf '  核心配置: %s\n' "$CONFIG_PATH"
+  if [[ -n $BACKUP_DIR ]]; then
+    printf '  本次备份: %s（仅 root 可读；paths.tsv 记录原路径）\n' "$BACKUP_DIR"
+  fi
   printf '  WebSocket 路径: %s…%s\n' "${WS_PATH:0:12}" "${WS_PATH: -4}"
   printf '\n%b\n' "${COLOR_GREEN}VMess 链接:${COLOR_RESET}"
   cat "$CLIENT_PATH"

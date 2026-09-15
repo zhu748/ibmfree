@@ -8,15 +8,25 @@ map "$request_method:$http_upgrade" $edge_websocket_request {
     ~*^GET:websocket$   1;
 }
 
+log_format edge_minimal '$time_iso8601 $request_method $status $body_bytes_sent $request_time';
+
 server {
     listen 443 ssl default_server;
     listen [::]:443 ssl default_server;
     server_name _;
     server_tokens off;
+    access_log /var/log/nginx/access.log edge_minimal;
+    error_page 404 =404 @edge_not_found;
 
     ssl_certificate {{TLS_CERT_PATH}};
     ssl_certificate_key {{TLS_KEY_PATH}};
     ssl_reject_handshake on;
+    return 404;
+
+    location @edge_not_found {
+        default_type text/html;
+        return 404 '<!doctype html><html lang="en"><title>Not Found</title><h1>Not Found</h1></html>';
+    }
 }
 
 server {
@@ -24,6 +34,9 @@ server {
     listen [::]:443 ssl http2;
     server_name {{PUBLIC_DOMAIN}};
     server_tokens off;
+    access_log /var/log/nginx/access.log edge_minimal;
+    absolute_redirect off;
+    error_page 403 404 =404 @edge_not_found;
 
     ssl_certificate {{TLS_CERT_PATH}};
     ssl_certificate_key {{TLS_KEY_PATH}};
@@ -49,6 +62,8 @@ server {
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_pass http://127.0.0.1:{{SING_BOX_PORT}};
+        proxy_intercept_errors on;
+        error_page 400 403 404 405 426 500 502 503 504 =404 @edge_not_found;
         access_log off;
     }
 
@@ -57,8 +72,17 @@ server {
     }
 
     location ~ /\. {
-        deny all;
+        return 404;
         access_log off;
         log_not_found off;
+    }
+
+    location ~* (\.bak($|[./])|\.restore\.|\.(old|orig|save|swp|tmp)$|~$|/(config\.json|client\.txt|tunnel\.token)$) {
+        return 404;
+    }
+
+    location @edge_not_found {
+        default_type text/html;
+        return 404 '<!doctype html><html lang="en"><title>Not Found</title><h1>Not Found</h1></html>';
     }
 }

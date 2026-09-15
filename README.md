@@ -55,7 +55,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstra
 
 安装后会检查本地首页和 Nginx 到 sing-box 的 WebSocket 握手，并有限重试以等待服务就绪。本地通过不代表 Cloudflare Token、域名映射或 VMess 认证已经通过公网验证；最终仍需导入链接测试。健康检查不使用环境代理，也不会把 Token 放进请求。
 
-写入阶段失败或收到 Ctrl+C／终止信号时，安装器会尝试回滚配置。备份先复制到目标目录的临时文件，成功后再替换；复制失败或备份缺失时会保留当前文件并报告具体路径。备份仍保留在原目录，回滚不卸载已经安装的软件包；强制结束进程（SIGKILL）或断电无法触发退出处理。
+写入阶段失败或收到 Ctrl+C／终止信号时，安装器会尝试回滚配置。备份先复制到目标目录的临时文件，成功后再替换；复制失败或备份缺失时会保留当前文件并报告具体路径。新备份统一保存在 `/var/backups/edge-router/install.*` 的 root-only 目录，`paths.tsv` 记录原文件路径，不再写入网页目录。旧版留下的备份不自动删除，但本项目 Nginx 站点会拒绝访问 `.bak`、`.restore` 等备份路径。回滚不卸载已经安装的软件包；强制结束进程（SIGKILL）或断电无法触发退出处理。
 
 也可以克隆仓库后运行：
 
@@ -113,6 +113,10 @@ curl -I https://edge.example.com/
 
 随机路径和正常站点可以减少低成本主动探测，但不会改变 VMess/WebSocket 协议本身，也不应被视为不可识别。安全性仍依赖 UUID 保密、TLS、及时升级、最小化开放端口及 Cloudflare/WAF 规则。
 
+本项目的站点对未找到页面、受保护文件和 WebSocket 上游错误返回相同的 404 正文；有效 WebSocket 升级仍返回 101。目录跳转使用相对地址，不携带内部 HTTP scheme 和 8001 端口。重装默认保留现有首页，只有首次安装或显式提供 `SITE_INDEX_FILE` 时才生成／替换；用户自己的真实静态页面比统一模板更适合公开展示。
+
+访问日志仅保留时间、方法、状态、字节数和耗时，不记录 URL／查询串／Referer。错误日志仍保留用于排障，可能包含请求路径；系统管理员、Cloudflare 和 VPS 提供方仍可能观察到相关信息。本项目不会清除系统审计或保证规避流量识别。
+
 ## 开发验证
 
 仓库包含隔离的回归测试，覆盖首次安装、重复安装、旧配置异常、端口、cloudflared 能力检查、下载失败、回滚、VMess 链接和本机 WebSocket 握手。测试只使用临时目录和回环地址，不安装软件、不访问真实 `/etc`，也不需要 Cloudflare 凭据。运行环境需要 Bash、curl、tar 和 Node.js（Node.js 仅用于测试，VPS 安装不需要）。
@@ -122,6 +126,8 @@ bash tests/run.sh
 ```
 
 Windows 可使用 Git Bash 在仓库目录执行相同命令。`Test installer` 工作流会在安装器、模板或测试变更时于 Ubuntu 24.04 运行测试；这不能替代 s390x/systemd VPS 上的完整安装验证。
+
+CI 还会安装 Nginx 并执行 `node tests/nginx-privacy.cjs`：使用测试专属临时目录、回环端口和一次性证书，实际验证 Tunnel/Direct 模板的 404、备份拒绝访问、日志字段、目录跳转、SNI 拒绝和有效 WebSocket 升级。该步骤在开发机需要预装 Nginx 与 OpenSSL，不会修改系统 Nginx 配置。
 
 ## 来源
 

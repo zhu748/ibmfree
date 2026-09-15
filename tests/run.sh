@@ -12,6 +12,7 @@ load_installer() {
   sed -e 's/\r$//' \
     -e 's|^readonly CONFIG_DIR=.*|readonly CONFIG_DIR="${TEST_ROOT}/config"|' \
     -e 's|^readonly SITE_ROOT=.*|readonly SITE_ROOT="${TEST_ROOT}/site"|' \
+    -e 's|^readonly BACKUP_ROOT=.*|readonly BACKUP_ROOT="${TEST_ROOT}/backups"|' \
     -e 's|^readonly NGINX_CONFIG=.*|readonly NGINX_CONFIG="${TEST_ROOT}/nginx.conf"|' \
     -e 's|^readonly SYSTEMD_DIR=.*|readonly SYSTEMD_DIR="${TEST_ROOT}/units"|' \
     -e 's|^readonly SING_BOX_BIN=.*|readonly SING_BOX_BIN="${TEST_ROOT}/edge-router"|' \
@@ -203,6 +204,39 @@ test_backup_once() {
   backup_file "$file"
   assert_equal "${#ROLLBACK_TARGETS[@]}" 1
   assert_equal "$(<"${ROLLBACK_BACKUPS[0]}")" original
+  [[ ${ROLLBACK_BACKUPS[0]} == "$BACKUP_ROOT"/* ]] || fail 'backup outside private directory'
+  grep -Fq -- "$file" "${BACKUP_DIR}/paths.tsv"
+  [[ -z $(find "$TEST_ROOT" -maxdepth 1 -name '*.bak*' -print) ]] || fail 'backup left beside original'
+}
+
+test_site_preserved() {
+  mkdir -p "$SITE_ROOT"
+  printf '<html>user-owned site</html>' >"${SITE_ROOT}/index.html"
+  render_site "${TEST_ROOT}/rendered.html"
+  assert_equal "$(<"${TEST_ROOT}/rendered.html")" '<html>user-owned site</html>'
+  SITE_INDEX_FILE="${TEST_ROOT}/custom.html"
+  printf '<html>replacement site</html>' >"$SITE_INDEX_FILE"
+  render_site "${TEST_ROOT}/rendered.html"
+  assert_equal "$(<"${TEST_ROOT}/rendered.html")" '<html>replacement site</html>'
+}
+
+test_site_no_deployment_marker() {
+  render_site "${TEST_ROOT}/rendered.html"
+  if grep -qE -- '--site-key|\{\{SITE_' "${TEST_ROOT}/rendered.html"; then
+    fail 'public deployment marker left in page'
+  fi
+}
+
+test_site_backup_private() {
+  mkdir -p "$SITE_ROOT"
+  printf old >"${SITE_ROOT}/index.html"
+  backup_file "${SITE_ROOT}/index.html"
+  assert_equal "$(<"${ROLLBACK_BACKUPS[0]}")" old
+  assert_equal "$(find "$SITE_ROOT" -type f | wc -l | tr -d ' ')" 1
+  if [[ $(uname -s) == Linux ]]; then
+    assert_equal "$(stat -c '%a' "$BACKUP_ROOT")" 700
+    assert_equal "$(stat -c '%a' "$BACKUP_DIR")" 700
+  fi
 }
 
 test_missing_backup() {
@@ -391,7 +425,8 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_empty_config test_ambiguous_config test_three_inputs test_port_validation test_same_port \
   test_large_cloudflared_help test_broken_cloudflared test_websocket_upgrade \
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \
-  test_backup_once test_missing_backup test_atomic_restore_copy_failure test_rollback_restores_files \
+  test_backup_once test_site_preserved test_site_no_deployment_marker test_site_backup_private \
+  test_missing_backup test_atomic_restore_copy_failure test_rollback_restores_files \
   test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link \
   test_real_http test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do
   ((count += 1))

@@ -51,6 +51,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstra
 
 安装器只会要求 UUID（可留空自动生成）、公网域名和 Cloudflare Tunnel Token。完成后会直接打印 `vmess://` 链接。重复安装时会复用现有 UUID、WebSocket 路径和内部端口，避免旧客户端无故失效。引导脚本会下载完整仓库归档，正式安装仍由仓库中的模板化安装器执行。
 
+重复安装时，UUID 提示中的默认值来自本安装器已有配置，回车即可保留；显式传入 `UUID`、`WS_PATH`、`SING_BOX_PORT` 时以传入值为准。已有配置为空或无法唯一读取时，安装器停止而不会静默生成新身份；此时请先检查并备份 `/etc/edge-router/config.json`。这不等同于自动迁移其他脚本生成的配置。
+
+安装后会检查本地首页和 Nginx 到 sing-box 的 WebSocket 握手，并有限重试以等待服务就绪。本地通过不代表 Cloudflare Token、域名映射或 VMess 认证已经通过公网验证；最终仍需导入链接测试。健康检查不使用环境代理，也不会把 Token 放进请求。
+
+写入阶段失败或收到 Ctrl+C／终止信号时，安装器会尝试回滚配置。备份先复制到目标目录的临时文件，成功后再替换；复制失败或备份缺失时会保留当前文件并报告具体路径。备份仍保留在原目录，回滚不卸载已经安装的软件包；强制结束进程（SIGKILL）或断电无法触发退出处理。
+
 也可以克隆仓库后运行：
 
 ```bash
@@ -106,6 +112,16 @@ curl -I https://edge.example.com/
 ## 安全边界
 
 随机路径和正常站点可以减少低成本主动探测，但不会改变 VMess/WebSocket 协议本身，也不应被视为不可识别。安全性仍依赖 UUID 保密、TLS、及时升级、最小化开放端口及 Cloudflare/WAF 规则。
+
+## 开发验证
+
+仓库包含隔离的回归测试，覆盖首次安装、重复安装、旧配置异常、端口、cloudflared 能力检查、下载失败、回滚、VMess 链接和本机 WebSocket 握手。测试只使用临时目录和回环地址，不安装软件、不访问真实 `/etc`，也不需要 Cloudflare 凭据。运行环境需要 Bash、curl、tar 和 Node.js（Node.js 仅用于测试，VPS 安装不需要）。
+
+```bash
+bash tests/run.sh
+```
+
+Windows 可使用 Git Bash 在仓库目录执行相同命令。`Test installer` 工作流会在安装器、模板或测试变更时于 Ubuntu 24.04 运行测试；这不能替代 s390x/systemd VPS 上的完整安装验证。
 
 ## 来源
 

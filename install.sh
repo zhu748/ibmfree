@@ -76,7 +76,6 @@ warn() {
 
 die() {
   printf '%b\n' "${COLOR_RED}错误: $*${COLOR_RESET}" >&2
-  rollback_installation
   exit 1
 }
 
@@ -91,12 +90,25 @@ cleanup() {
 on_error() {
   local exit_code=$?
   printf '%b\n' "${COLOR_RED}安装在第 ${BASH_LINENO[0]} 行失败（退出码: ${exit_code}）。${COLOR_RESET}" >&2
-  rollback_installation
   exit "$exit_code"
 }
 
-trap cleanup EXIT
+on_exit() {
+  local exit_code=$?
+  trap - EXIT ERR INT TERM
+  if [[ $ROLLBACK_ACTIVE == "true" ]]; then
+    # An uncommitted transaction must never be reported as a successful install.
+    ((exit_code != 0)) || exit_code=1
+    rollback_installation || true
+  fi
+  cleanup
+  exit "$exit_code"
+}
+
+trap on_exit EXIT
 trap on_error ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 require_file() {
   [[ -f $1 ]] || die "缺少仓库文件: $1。请克隆完整仓库后运行，不要使用 curl | bash。"
@@ -183,7 +195,7 @@ validate_domain() {
 }
 
 validate_port() {
-  [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535))
+  [[ $1 =~ ^[0-9]{4,5}$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535))
 }
 
 validate_ws_path() {
@@ -276,6 +288,8 @@ install_cloudflared_s390x() {
 }
 
 ensure_cloudflared() {
+  local help_output=""
+
   if [[ -z "$CLOUDFLARED_BIN" ]]; then
     CLOUDFLARED_BIN=$(command -v cloudflared || true)
   fi
@@ -286,7 +300,9 @@ ensure_cloudflared() {
 
   [[ $CLOUDFLARED_BIN =~ ^/[A-Za-z0-9_./-]+$ ]] || die "cloudflared 路径包含不安全字符。"
   [[ -x $CLOUDFLARED_BIN ]] || die "cloudflared 不存在或不可执行: ${CLOUDFLARED_BIN}"
-  "$CLOUDFLARED_BIN" tunnel run --help 2>&1 | grep -q -- '--token-file' || \
+  help_output=$("$CLOUDFLARED_BIN" tunnel run --help 2>&1) || \
+    die "cloudflared 无法执行，请检查二进制架构和文件权限。"
+  [[ $help_output == *"--token-file"* ]] || \
     die "当前 cloudflared 版本不支持 --token-file，请升级。"
 }
 
@@ -315,7 +331,7 @@ read_json_string() {
   local file=$1
   local key=$2
 
-  grep -m1 -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" "$file" 2>/dev/null | \
+  grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" "$file" 2>/dev/null | \
     sed -E 's/^[^:]+:[[:space:]]*"//; s/"$//' || true
 }
 
@@ -323,7 +339,7 @@ read_json_number() {
   local file=$1
   local key=$2
 
-  grep -m1 -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" "$file" 2>/dev/null | \
+  grep -oE "\"${key}\"[[:space:]]*:[[:space:]]*[0-9]+" "$file" 2>/dev/null | \
     sed -E 's/^[^:]+:[[:space:]]*//' || true
 }
 
@@ -334,10 +350,14 @@ collect_configuration() {
   local generated_uuid=""
   local tunnel_token=""
 
-  if [[ -s $CONFIG_PATH ]]; then
+  if [[ -e $CONFIG_PATH || -L $CONFIG_PATH ]]; then
+    [[ -r $CONFIG_PATH && -s $CONFIG_PATH ]] || die "现有配置为空或不可读，已停止以保留原连接参数: ${CONFIG_PATH}"
     existing_uuid=$(read_json_string "$CONFIG_PATH" uuid)
     existing_path=$(read_json_string "$CONFIG_PATH" path)
     existing_port=$(read_json_number "$CONFIG_PATH" listen_port)
+
+    validate_uuid "$existing_uuid" && validate_ws_path "$existing_path" && validate_port "$existing_port" || \
+      die "无法唯一读取现有 UUID、WS 路径和端口，已停止；请检查 ${CONFIG_PATH}，不要直接删除旧配置。"
 
     if [[ -z "$WS_PATH" ]] && validate_ws_path "$existing_path"; then
       WS_PATH=$existing_path
@@ -353,7 +373,7 @@ collect_configuration() {
     else
       generated_uuid=$(generate_uuid)
     fi
-    read_value CUSTOM_UUID "UUID（留空自动生成）" "$generated_uuid"
+    read_value CUSTOM_UUID "UUID（回车使用默认值）" "$generated_uuid"
   fi
   validate_uuid "$CUSTOM_UUID" || die "UUID 格式无效。"
 
@@ -374,10 +394,12 @@ collect_configuration() {
   validate_ws_path "$WS_PATH" || die "WS_PATH 必须是 16-120 位安全路径，且不能以 / 结尾。"
 
   validate_port "$ORIGIN_PORT" || die "ORIGIN_PORT 必须是 1024-65535 之间的端口。"
+  ORIGIN_PORT=$((10#$ORIGIN_PORT))
   if [[ -z "$SING_BOX_PORT" ]]; then
     SING_BOX_PORT=$(choose_internal_port)
   fi
   validate_port "$SING_BOX_PORT" || die "SING_BOX_PORT 必须是 1024-65535 之间的端口。"
+  SING_BOX_PORT=$((10#$SING_BOX_PORT))
   [[ $SING_BOX_PORT != "$ORIGIN_PORT" ]] || die "两个内部端口不能相同。"
 
   if [[ $DEPLOY_MODE == "direct" ]]; then
@@ -386,8 +408,6 @@ collect_configuration() {
     [[ -s $TLS_CERT_FILE ]] || die "TLS 证书不存在或为空。"
     [[ -s $TLS_KEY_FILE ]] || die "TLS 私钥不存在或为空。"
   else
-    ensure_cloudflared
-
     if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
       [[ -s $TUNNEL_TOKEN_FILE ]] || die "TUNNEL_TOKEN_FILE 不存在或为空。"
     else
@@ -442,23 +462,47 @@ restore_service_state() {
   fi
 }
 
+restore_backup_file() {
+  local backup=$1
+  local target=$2
+  local staged=""
+
+  # Keep the live file intact until a same-directory backup copy is ready.
+  staged=$(mktemp "${target}.restore.XXXXXXXX") || return 1
+  if cp --archive --no-dereference --remove-destination --no-target-directory "$backup" "$staged" &&
+    mv --force --no-target-directory "$staged" "$target"; then
+    return 0
+  fi
+  rm -f -- "$staged"
+  return 1
+}
+
 rollback_installation() {
   local index target backup
+  local failed=0
 
   [[ $ROLLBACK_ACTIVE == "true" ]] || return 0
   ROLLBACK_ACTIVE=false
-  trap - ERR
-  set +e
   warn "正在恢复本次安装前的配置……"
 
   for ((index = ${#ROLLBACK_TARGETS[@]} - 1; index >= 0; index--)); do
     target=${ROLLBACK_TARGETS[index]}
     backup=${ROLLBACK_BACKUPS[index]}
-    if [[ -n $backup && -e $backup ]]; then
-      rm -f -- "$target"
-      cp --archive --no-dereference "$backup" "$target"
+    if [[ -n $backup ]]; then
+      if [[ ! -e $backup && ! -L $backup ]]; then
+        warn "备份缺失，保留当前文件而不删除: ${target}"
+        failed=1
+        continue
+      fi
+      if ! restore_backup_file "$backup" "$target"; then
+        warn "备份恢复失败，当前文件和备份均已保留: ${target}"
+        failed=1
+      fi
     else
-      rm -f -- "$target"
+      if ! rm -f -- "$target"; then
+        warn "无法移除本次安装创建的文件: ${target}"
+        failed=1
+      fi
     fi
   done
 
@@ -466,16 +510,24 @@ rollback_installation() {
   restore_service_state "$SERVICE_NAME" "$EDGE_WAS_ACTIVE" "$EDGE_WAS_ENABLED"
   restore_service_state nginx "$NGINX_WAS_ACTIVE" "$NGINX_WAS_ENABLED"
   restore_service_state "$TUNNEL_SERVICE_NAME" "$TUNNEL_WAS_ACTIVE" "$TUNNEL_WAS_ENABLED"
-  warn "已尝试恢复原配置和服务状态；备份文件仍保留在原目录。"
+  if ((failed)); then
+    warn "部分文件未能回滚，请根据上方路径手动检查；已尝试恢复服务状态。"
+  else
+    warn "配置文件已恢复；已尝试恢复原服务状态，备份文件仍保留在原目录。"
+  fi
+  return "$failed"
 }
 
 backup_file() {
   local path=$1
-  local stamp backup=""
+  local stamp backup="" existing_target
+  for existing_target in "${ROLLBACK_TARGETS[@]}"; do
+    [[ $existing_target != "$path" ]] || return 0
+  done
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
 
   if [[ -e $path || -L $path ]]; then
-    backup="${path}.bak.${stamp}"
+    backup="${path}.bak.${stamp}.$$"
     cp --archive --no-dereference "$path" "$backup"
   fi
 
@@ -627,18 +679,57 @@ write_client_link() {
   printf 'vmess://%s\n' "$encoded_link" | install -o root -g root -m 0600 /dev/stdin "$CLIENT_PATH"
 }
 
-check_local_site() {
-  local status
-
+local_http_request() {
+  local path=$1
+  shift
+  # Ignore shell proxy settings and ~/.curlrc for loopback-only diagnostics.
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
-    status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-      --max-time 10 --header "Host: ${PUBLIC_DOMAIN}" "http://127.0.0.1:${ORIGIN_PORT}/")
+    curl --disable --noproxy '*' --silent --http1.1 --output /dev/null \
+      --connect-timeout 2 --max-time 3 --header "Host: ${PUBLIC_DOMAIN}" \
+      "$@" "http://127.0.0.1:${ORIGIN_PORT}${path}"
   else
-    status=$(curl --silent --show-error --insecure --output /dev/null --write-out '%{http_code}' \
-      --max-time 10 --resolve "${PUBLIC_DOMAIN}:443:127.0.0.1" "https://${PUBLIC_DOMAIN}/")
+    # This checks only the local route, including Origin CA certificates.
+    curl --disable --noproxy '*' --silent --http1.1 --insecure --output /dev/null \
+      --connect-timeout 2 --max-time 3 --resolve "${PUBLIC_DOMAIN}:443:127.0.0.1" \
+      "$@" "https://${PUBLIC_DOMAIN}${path}"
   fi
+}
 
-  [[ $status == "200" ]] || die "本地站点健康检查失败，HTTP 状态码: ${status}。"
+check_local_site() {
+  local attempt status="" headers="" curl_status=0
+  TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+  headers="${TEMP_DIR}/websocket.headers"
+
+  for attempt in 1 2 3 4 5; do
+    status=$(local_http_request / --write-out '%{http_code}') || status="000"
+    if [[ $status == "200" ]]; then
+      : >"$headers"
+      curl_status=0
+      local_http_request "$WS_PATH" --dump-header "$headers" \
+        --header 'Connection: Upgrade' --header 'Upgrade: websocket' \
+        --header 'Sec-WebSocket-Version: 13' \
+        --header 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' || curl_status=$?
+
+      # curl may time out after a successful upgrade because the socket stays open.
+      if ((curl_status == 0 || curl_status == 28)) &&
+        grep -Eiq '^HTTP/1\.1 101([[:space:]]|$)' "$headers" &&
+        grep -Eiq '^Upgrade:[[:space:]]*websocket[[:space:]]*$' "$headers" &&
+        grep -Eiq '^Connection:[[:space:]]*([^,]+,[[:space:]]*)*upgrade([[:space:]]*,|[[:space:]]*$)' "$headers" &&
+        awk -F ':' '
+          tolower($1) == "sec-websocket-accept" {
+            value = substr($0, index($0, ":") + 1)
+            gsub(/^[ \t]+|[ \t\r]+$/, "", value)
+            if (value == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") valid = 1
+          }
+          END { exit !valid }
+        ' "$headers"; then
+        return 0
+      fi
+    fi
+    ((attempt == 5)) || sleep 1
+  done
+
+  die "本地 HTTP/WebSocket 检查失败（首页 HTTP: ${status}）。请检查 edge-router/nginx 服务和监听端口；未确认公网连通。"
 }
 
 activate_services() {
@@ -698,6 +789,7 @@ show_summary() {
   else
     warn "direct 模式请确保域名已解析到本机，并仅开放必要的 443/TCP 入站。"
   fi
+  warn "已验证本地 HTTP/WebSocket；仍需使用客户端确认公网 Tunnel/TLS 和 VMess 认证连通。"
 }
 
 main() {
@@ -715,6 +807,9 @@ main() {
 
   install_packages
   collect_configuration
+  if [[ $DEPLOY_MODE == "tunnel" ]]; then
+    ensure_cloudflared
+  fi
   create_service_user
   install_sing_box
   write_configuration

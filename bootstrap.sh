@@ -27,17 +27,37 @@ cleanup() {
 
 trap cleanup EXIT
 
-((EUID == 0)) || die "请先执行 sudo -i 切换到 root，再运行一键安装命令。"
-[[ $(uname -s) == "Linux" ]] || die "仅支持 Linux。"
-[[ $(uname -m) == "s390x" || $(uname -m) == "s390" ]] || die "此一键入口仅用于 s390x。"
-command -v curl >/dev/null 2>&1 || die "缺少 curl，请先通过系统包管理器安装。"
-command -v tar >/dev/null 2>&1 || die "缺少 tar，请先通过系统包管理器安装。"
+download_repository() {
+  local archive="${TEMP_DIR}/repository.tar.gz"
+  local source_dir="${TEMP_DIR}/source"
 
-TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ibmfree-bootstrap.XXXXXXXX")
-curl --fail --location --silent --show-error \
-  --retry 3 --connect-timeout 15 --max-time 300 \
-  "$REPOSITORY_ARCHIVE" | tar -xz --strip-components=1 -C "$TEMP_DIR"
+  # Finish retries before extracting: a partial stream must never reach bash.
+  curl --disable --fail --location --silent --show-error \
+    --proto '=https' --proto-redir '=https' \
+    --retry 3 --connect-timeout 15 --max-time 300 \
+    --output "$archive" "$REPOSITORY_ARCHIVE" || die "仓库下载失败，尚未执行安装器；请稍后重试。"
+  mkdir -p "$source_dir"
+  tar -xzf "$archive" --strip-components=1 --no-same-owner -C "$source_dir" || \
+    die "仓库归档无效，尚未执行安装器。"
+  [[ -s ${source_dir}/install.sh && -d ${source_dir}/templates ]] || \
+    die "仓库归档不完整，缺少安装器或模板。"
+}
 
-export DEPLOY_MODE=tunnel
-export ORIGIN_PORT=8001
-bash "${TEMP_DIR}/install.sh"
+main() {
+  ((EUID == 0)) || die "请先执行 sudo -i 切换到 root，再运行一键安装命令。"
+  [[ $(uname -s) == "Linux" ]] || die "仅支持 Linux。"
+  [[ $(uname -m) == "s390x" || $(uname -m) == "s390" ]] || die "此一键入口仅用于 s390x。"
+  command -v curl >/dev/null 2>&1 || die "缺少 curl，请先通过系统包管理器安装。"
+  command -v tar >/dev/null 2>&1 || die "缺少 tar，请先通过系统包管理器安装。"
+
+  TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ibmfree-bootstrap.XXXXXXXX")
+  download_repository
+
+  export DEPLOY_MODE=tunnel
+  export ORIGIN_PORT=8001
+  bash "${TEMP_DIR}/source/install.sh"
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

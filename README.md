@@ -133,6 +133,8 @@ Windows 可使用 Git Bash 在仓库目录执行相同命令；实际 `flock` �
 
 CI 还会安装 Nginx 并执行 `node tests/nginx-privacy.cjs`：使用测试专属临时目录、回环端口和一次性证书，实际验证 Tunnel/Direct 模板的 404、备份拒绝访问、日志字段、目录跳转、SNI 拒绝和有效 WebSocket 升级。该步骤在开发机需要预装 Nginx 与 OpenSSL，不会修改系统 Nginx 配置。
 
+`node tests/vmess-loopback.cjs` 会下载安装器固定版本的官方 sing-box 发布包，使用安装器中的架构 SHA-256 校验，在临时目录运行真实客户端／服务端及 Nginx。测试复用安装器生成的配置和 `vmess://` 链接，覆盖并发 1 MiB 下载、上传回传的 SHA-256 完整性校验、错误 UUID／路径拒绝及拒绝后的恢复连接。Direct 模式使用一次性证书验证 TLS（不跳过证书校验）；Tunnel 模式只测本地 HTTP origin 链路，不连接 Cloudflare。此测试需要 Linux、Bash、Node.js、Nginx、OpenSSL、curl、tar；不要求 root、不调用 systemd、不增加 VPS 安装依赖。CI 在 amd64 运行，不能替代 s390x 实机、其他客户端、UDP 或公网 Tunnel 测试。
+
 ## 来源
 
 - 核心：[SagerNet/sing-box](https://github.com/SagerNet/sing-box)

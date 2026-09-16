@@ -507,6 +507,14 @@ test_client_link() {
   node -e 'const fs=require("fs"),assert=require("assert/strict"); const link=fs.readFileSync(process.argv[1],"utf8").trim(); assert.ok(link.startsWith("vmess://")); const c=JSON.parse(Buffer.from(link.slice(8),"base64").toString("utf8")); assert.equal(c.id,"11111111-1111-4111-8111-111111111111"); assert.equal(c.add,"edge.example.com"); assert.equal(c.path,Buffer.from(process.argv[2],"base64").toString("utf8")); assert.equal(c.net,"ws"); assert.equal(c.tls,"tls"); assert.equal(c.port,"443"); assert.ok(!JSON.stringify(c).includes("test-only-token"));' "$CLIENT_PATH" "$(printf '%s' "$WS_PATH" | base64 | tr -d '\r\n')"
 }
 
+test_vmess_fixture() {
+  mkdir "${TEST_ROOT}/fixture"
+  local metadata
+  metadata=$(bash "${REPO_ROOT}/tests/prepare-vmess.sh" "${TEST_ROOT}/fixture" 23456 23457)
+  [[ $metadata =~ ^[0-9]+\.[0-9]+\.[0-9]+\ (amd64|arm64|s390x)\ [a-f0-9]{64}$ ]] || fail 'invalid release fixture metadata'
+  node -e 'const fs=require("fs"),path=require("path"),assert=require("assert/strict"); const root=process.argv[1]; const c=JSON.parse(fs.readFileSync(path.join(root,"config/config.json"),"utf8")); const uri=fs.readFileSync(path.join(root,"config/client.txt"),"utf8").trim(); assert.ok(uri.startsWith("vmess://")); const v=JSON.parse(Buffer.from(uri.slice(8),"base64").toString("utf8")); assert.equal(v.id,c.inbounds[0].users[0].uuid); assert.equal(v.path,c.inbounds[0].transport.path); assert.equal(c.inbounds[0].listen_port,23456); assert.equal(v.net,"ws"); assert.equal(v.tls,"tls"); for (const mode of ["tunnel","direct"]) { const n=fs.readFileSync(path.join(root,mode+".tpl.conf"),"utf8"); assert.ok(n.includes(v.path)); assert.ok(n.includes("127.0.0.1:23456")); assert.ok(!n.includes("{{")); }' "${TEST_ROOT}/fixture"
+}
+
 test_real_http() {
   local pid attempt
   node "${REPO_ROOT}/tests/http-server.cjs" "${TEST_ROOT}/port" >"${TEST_ROOT}/server.log" 2>&1 &
@@ -625,7 +633,7 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \
   test_backup_once test_site_preserved test_site_no_deployment_marker test_site_backup_private \
   test_missing_backup test_atomic_restore_copy_failure test_rollback_restores_files \
-  test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link \
+  test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link test_vmess_fixture \
   test_real_http test_real_socket_preflight \
   test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do
   ((count += 1))

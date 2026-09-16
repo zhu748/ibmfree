@@ -41,3 +41,5 @@ jobs:
           sudo apt-get install -y nginx
       - name: Verify actual nginx privacy and WebSocket behavior
         run: node tests/nginx-privacy.cjs
+      - name: Verify real VMess authentication and bidirectional traffic
+        run: node tests/vmess-loopback.cjs

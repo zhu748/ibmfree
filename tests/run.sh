@@ -300,7 +300,9 @@ test_choose_port_exhausted() {
 
 test_large_cloudflared_help() {
   CLOUDFLARED_BIN="${TEST_ROOT}/cloudflared"
-  printf '%s\n' '#!/usr/bin/env bash' "printf '%s\n' '--token-file'" \
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '[[ $* == "tunnel --no-autoupdate --metrics 127.0.0.1:0 run --help" ]] || exit 2' \
+    "printf '%s\n' '--token-file'" \
     "printf '%200000s\n' x" >"$CLOUDFLARED_BIN"
   chmod 0755 "$CLOUDFLARED_BIN"
   ensure_cloudflared
@@ -313,6 +315,81 @@ test_broken_cloudflared() {
   if (ensure_cloudflared) >"${TEST_ROOT}/error" 2>&1; then
     fail 'failed executable was accepted'
   fi
+}
+
+test_tunnel_metrics_private() {
+  CLOUDFLARED_BIN=/usr/local/bin/cloudflared
+  render_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl" "${TEST_ROOT}/tunnel.service"
+  grep -Fqx -- "ExecStart=${CLOUDFLARED_BIN} tunnel --no-autoupdate --metrics 127.0.0.1:0 run --token-file ${TOKEN_PATH}" \
+    "${TEST_ROOT}/tunnel.service"
+  if grep -q 'test-only-token' "${TEST_ROOT}/tunnel.service"; then fail 'service contains token contents'; fi
+}
+
+mock_listener_audit() {
+  ss() {
+    assert_equal "$*" '-H -lntp'
+    printf '%s' "${MOCK_LISTENERS:-}"
+    return "${MOCK_SS_STATUS:-0}"
+  }
+  systemctl() {
+    assert_equal "$1" show
+    assert_equal "$3 $4" '--property=MainPID --value'
+    case "$2" in
+      edge-router) printf 100 ;;
+      nginx) printf 200 ;;
+      edge-tunnel) printf 300 ;;
+      *) fail 'unrelated service queried' ;;
+    esac
+  }
+}
+
+test_listener_audit_loopback() {
+  mock_listener_audit
+  MOCK_LISTENERS=$'LISTEN 0 511 127.0.0.1:23456 0.0.0.0:* users:(("core",pid=100,fd=8))\nLISTEN 0 511 127.0.0.1:8001 0.0.0.0:* users:(("nginx",pid=200,fd=9))\nLISTEN 0 511 [::1]:20241 [::]:* users:(("connector",pid=300,fd=10))\nLISTEN 0 511 127.0.0.2:20242 0.0.0.0:* users:(("connector",pid=300,fd=11))\nLISTEN 0 511 [::ffff:127.0.0.1]:20243 [::]:* users:(("connector",pid=300,fd=12))'
+  warn_extra_tcp_listeners 2>"${TEST_ROOT}/warnings"
+  [[ ! -s ${TEST_ROOT}/warnings ]] || fail 'loopback listener reported as external'
+}
+
+test_listener_audit_exposure() {
+  mock_listener_audit
+  MOCK_LISTENERS=$'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=200,fd=9))\nLISTEN 0 511 [::]:20241 [::]:* users:(("connector",pid=300,fd=10))\nLISTEN 0 511 192.0.2.1:23456 0.0.0.0:* users:(("core",pid=100,fd=8))'
+  warn_extra_tcp_listeners 2>"${TEST_ROOT}/warnings"
+  for address in '0.0.0.0:80' '[::]:20241' '192.0.2.1:23456'; do
+    grep -Fq -- "$address" "${TEST_ROOT}/warnings"
+  done
+  assert_equal "$(wc -l <"${TEST_ROOT}/warnings" | tr -d ' ')" 3
+  grep -q '安装器未关闭该入口' "${TEST_ROOT}/warnings"
+}
+
+test_listener_audit_direct() {
+  mock_listener_audit
+  DEPLOY_MODE=direct
+  MOCK_LISTENERS=$'LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=200,fd=8))\nLISTEN 0 511 [::]:443 [::]:* users:(("nginx",pid=200,fd=9))\nLISTEN 0 511 *:80 *:* users:(("nginx",pid=200,fd=10))\nLISTEN 0 511 127.0.0.1:23456 0.0.0.0:* users:(("core",pid=100,fd=8))'
+  warn_extra_tcp_listeners 2>"${TEST_ROOT}/warnings"
+  grep -Fq '*:80' "${TEST_ROOT}/warnings"
+  if grep -q ':443' "${TEST_ROOT}/warnings"; then fail 'expected Direct TLS port reported'; fi
+  assert_equal "$(wc -l <"${TEST_ROOT}/warnings" | tr -d ' ')" 1
+}
+
+test_listener_audit_unrelated() {
+  mock_listener_audit
+  MOCK_LISTENERS=$'LISTEN 0 511 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=999,fd=8))\nLISTEN 0 511 0.0.0.0:8080 0.0.0.0:* users:(("other",pid=1000,fd=8))'
+  warn_extra_tcp_listeners 2>"${TEST_ROOT}/warnings"
+  if grep -q '额外非回环' "${TEST_ROOT}/warnings"; then fail 'unrelated process or PID prefix matched'; fi
+  assert_equal "$(wc -l <"${TEST_ROOT}/warnings" | tr -d ' ')" 3
+  grep -q '无法确认其绑定范围' "${TEST_ROOT}/warnings"
+}
+
+test_listener_audit_unavailable() {
+  mock_listener_audit
+  MOCK_SS_STATUS=1
+  warn_extra_tcp_listeners 2>"${TEST_ROOT}/warnings"
+  grep -q '无法检查额外 TCP 监听' "${TEST_ROOT}/warnings"
+  MOCK_SS_STATUS=0
+  systemctl() { return 1; }
+  warn_extra_tcp_listeners 2>"${TEST_ROOT}/warnings"
+  assert_equal "$(wc -l <"${TEST_ROOT}/warnings" | tr -d ' ')" 3
+  grep -q '未完成该服务的额外监听检查' "${TEST_ROOT}/warnings"
 }
 
 mock_http() {
@@ -801,7 +878,9 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_port_preflight_free test_port_preflight_owned test_port_preflight_conflicts \
   test_port_preflight_errors test_port_preflight_modes \
   test_choose_port_free test_choose_port_failure test_choose_port_exhausted \
-  test_large_cloudflared_help test_broken_cloudflared test_websocket_upgrade \
+  test_large_cloudflared_help test_broken_cloudflared test_tunnel_metrics_private \
+  test_listener_audit_loopback test_listener_audit_exposure test_listener_audit_direct \
+  test_listener_audit_unrelated test_listener_audit_unavailable test_websocket_upgrade \
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \
   test_backup_once test_site_preserved test_site_no_deployment_marker test_site_backup_private \
   test_atomic_install test_atomic_install_copy_failure test_atomic_install_rename_failure \

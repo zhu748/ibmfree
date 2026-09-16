@@ -8,7 +8,7 @@ Requires=nginx.service edge-router.service
 Type=simple
 User=edge-router
 Group=edge-router
-ExecStart={{CLOUDFLARED_BIN}} tunnel --no-autoupdate run --token-file {{TOKEN_FILE}}
+ExecStart={{CLOUDFLARED_BIN}} tunnel --no-autoupdate --metrics 127.0.0.1:0 run --token-file {{TOKEN_FILE}}
 Restart=on-failure
 RestartSec=5s
 

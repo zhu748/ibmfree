@@ -349,8 +349,8 @@ ensure_cloudflared() {
 
   [[ $CLOUDFLARED_BIN =~ ^/[A-Za-z0-9_./-]+$ ]] || die "cloudflared 路径包含不安全字符。"
   [[ -x $CLOUDFLARED_BIN ]] || die "cloudflared 不存在或不可执行: ${CLOUDFLARED_BIN}"
-  help_output=$("$CLOUDFLARED_BIN" tunnel run --help 2>&1) || \
-    die "cloudflared 无法执行，请检查二进制架构和文件权限。"
+  help_output=$("$CLOUDFLARED_BIN" tunnel --no-autoupdate --metrics 127.0.0.1:0 run --help 2>&1) || \
+    die "cloudflared 参数检查失败，请检查二进制架构、文件权限和 --metrics 支持。"
   [[ $help_output == *"--token-file"* ]] || \
     die "当前 cloudflared 版本不支持 --token-file，请升级。"
 }
@@ -809,6 +809,38 @@ check_local_site() {
   die "本地 HTTP/WebSocket 检查失败（首页 HTTP: ${status}）。请检查 edge-router/nginx 服务和监听端口；未确认公网连通。"
 }
 
+warn_extra_tcp_listeners() {
+  local listeners="" unit main_pid="" state recv_queue send_queue endpoint peer processes host port seen_listener
+  local -a units=("$SERVICE_NAME" nginx)
+  [[ $DEPLOY_MODE != tunnel ]] || units+=("$TUNNEL_SERVICE_NAME")
+  if ! listeners=$(ss -H -lntp 2>/dev/null); then
+    warn "无法检查额外 TCP 监听；请手动运行 sudo ss -lntp 核对公开入口。"
+    return 0
+  fi
+  for unit in "${units[@]}"; do
+    if ! main_pid=$(systemctl show "$unit" --property=MainPID --value 2>/dev/null) ||
+      [[ ! $main_pid =~ ^[1-9][0-9]*$ ]]; then
+      warn "无法确认 ${unit} 的进程，未完成该服务的额外监听检查。"
+      continue
+    fi
+    seen_listener=false
+    while read -r state recv_queue send_queue endpoint peer processes; do
+      [[ $processes == *"pid=${main_pid},"* ]] || continue
+      seen_listener=true
+      host=${endpoint%:*}
+      host=${host#[}
+      host=${host%]}
+      port=${endpoint##*:}
+      case "$host" in
+        127.* | ::1 | 0:0:0:0:0:0:0:1 | ::ffff:127.*) continue ;;
+      esac
+      [[ $unit != nginx || $DEPLOY_MODE != direct || $port != 443 ]] || continue
+      warn "${unit} 存在额外非回环 TCP 监听: ${endpoint}。请核对站点和防火墙；安装器未关闭该入口。"
+    done <<<"$listeners"
+    [[ $seen_listener == true ]] || warn "未取得 ${unit} 可归属的 TCP 监听信息，无法确认其绑定范围。"
+  done
+}
+
 activate_services() {
   local nginx_dump
 
@@ -848,6 +880,7 @@ activate_services() {
   fi
 
   check_local_site
+  warn_extra_tcp_listeners
   ROLLBACK_ACTIVE=false
 }
 

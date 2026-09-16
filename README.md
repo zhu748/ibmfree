@@ -29,6 +29,8 @@ http://127.0.0.1:8001
 
 安装器会把 Tunnel Token 保存为仅服务账户可读的文件，并通过 `--token-file` 启动，Token 不会出现在进程参数中。
 
+cloudflared 的 metrics／诊断服务显式绑定 `127.0.0.1:0`（由系统分配本地空闲端口），不依赖构建版本的默认监听地址，也不占用 8001。它只供本机诊断使用，不应在 Cloudflare Published application 或 Nginx 中另行公开。
+
 ### Direct 模式
 
 适合域名直接或经普通 Cloudflare 代理解析到服务器的环境。需要提前准备 TLS 证书和私钥；Nginx 监听 `443/TCP`。
@@ -58,6 +60,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstra
 重复安装时，UUID 提示中的默认值来自本安装器已有配置，回车即可保留；显式传入 `UUID`、`WS_PATH`、`SING_BOX_PORT` 时以传入值为准。已有配置为空或无法唯一读取时，安装器停止而不会静默生成新身份；此时请先检查并备份 `/etc/edge-router/config.json`。这不等同于自动迁移其他脚本生成的配置。
 
 安装后会检查本地首页和 Nginx 到 sing-box 的 WebSocket 握手，并有限重试以等待服务就绪。本地通过不代表 Cloudflare Token、域名映射或 VMess 认证已经通过公网验证；最终仍需导入链接测试。健康检查不使用环境代理，也不会把 Token 放进请求。
+
+安装结束还会按 systemd 主进程检查核心、Nginx 和 Tunnel 服务的非回环 TCP 监听。Direct 模式的 Nginx 443 属于预期入口；其他非回环监听会提示核对，例如 VPS 原有 Nginx 默认站点的 80 端口。检查只报告地址，不会删除已有站点、停止其他服务或修改防火墙；无法读取监听／主进程信息时也会提示。它不是全机端口审计，不覆盖其他进程、UDP、容器端口映射或公网防火墙可达性。
 
 写入阶段失败或收到 Ctrl+C／终止信号时，安装器会尝试回滚配置。备份先复制到目标目录的临时文件，成功后再替换；复制失败或备份缺失时会保留当前文件并报告具体路径。新备份统一保存在 `/var/backups/edge-router/install.*` 的 root-only 目录，`paths.tsv` 记录原文件路径，不再写入网页目录。旧版留下的备份不自动删除，但本项目 Nginx 站点会拒绝访问 `.bak`、`.restore` 等备份路径。回滚不卸载已经安装的软件包；强制结束进程（SIGKILL）或断电无法触发退出处理。
 

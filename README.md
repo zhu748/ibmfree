@@ -31,6 +31,8 @@ http://127.0.0.1:8001
 
 cloudflared 的 metrics／诊断服务显式绑定 `127.0.0.1:0`（由系统分配本地空闲端口），不依赖构建版本的默认监听地址，也不占用 8001。它只供本机诊断使用，不应在 Cloudflare Published application 或 Nginx 中另行公开。
 
+Tunnel 会按顺序拉起核心，但不再与核心单独停止的操作联动退出；Nginx 和 Tunnel 本身正常时，核心维护／故障期间静态页面仍可服务。此时 VMess 代理不可用，不代表故障已修复；安装流程仍必须通过核心服务及本地 WebSocket 检查才会报成功。需要停掉整个公开入口时应明确停止 `edge-tunnel`。
+
 ### Direct 模式
 
 适合域名直接或经普通 Cloudflare 代理解析到服务器的环境。需要提前准备 TLS 证书和私钥；Nginx 监听 `443/TCP`。
@@ -124,6 +126,8 @@ curl -I https://edge.example.com/
 随机路径和正常站点可以减少低成本主动探测，但不会改变 VMess/WebSocket 协议本身，也不应被视为不可识别。安全性仍依赖 UUID 保密、TLS、及时升级、最小化开放端口及 Cloudflare/WAF 规则。
 
 本项目的站点对未找到页面、受保护文件和 WebSocket 上游错误返回相同的 404 正文；有效 WebSocket 升级仍返回 101。目录跳转使用相对地址，不携带内部 HTTP scheme 和 8001 端口。重装默认保留现有首页，只有首次安装或显式提供 `SITE_INDEX_FILE` 时才生成／替换；用户自己的真实静态页面比统一模板更适合公开展示。
+
+秘密 WebSocket 路径上的上游 301／302／303／307／308 跳转也转为统一 404，避免返回内部地址的 Location；这不影响普通静态目录的正常跳转。集成测试另行覆盖上游断开、拒绝连接和恢复后的有效握手；Cloudflare 自身产生的错误页面不受源站模板控制。
 
 秘密路径仅在基础 WebSocket 握手字段完整时转发：GET、Upgrade 为 websocket、Connection 包含 Upgrade、版本为 13、Key 为 16 字节 nonce 的 Base64 形式；可解析的 HTTP 请求中，这些字段缺失或校验失败时在 Nginx 层返回普通 404，不交给核心生成协议错误。检查允许合法的大小写和 Connection 多 token 写法，不增加 User-Agent／Origin 限制。这不是 VMess 身份认证：完整握手仍可返回 101，之后由核心校验 UUID；路径和 UUID 仍需保密。
 

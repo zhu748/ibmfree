@@ -75,7 +75,7 @@ server {
         proxy_send_timeout 3600s;
         proxy_pass http://127.0.0.1:{{SING_BOX_PORT}};
         proxy_intercept_errors on;
-        error_page 400 403 404 405 426 500 502 503 504 =404 @edge_not_found;
+        error_page 301 302 303 307 308 400 403 404 405 426 500 502 503 504 =404 @edge_not_found;
         access_log off;
     }
 

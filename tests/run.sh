@@ -325,6 +325,16 @@ test_tunnel_metrics_private() {
   if grep -q 'test-only-token' "${TEST_ROOT}/tunnel.service"; then fail 'service contains token contents'; fi
 }
 
+test_tunnel_core_independent() {
+  render_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl" "${TEST_ROOT}/tunnel.service"
+  grep -Fqx 'Wants=network-online.target edge-router.service' "${TEST_ROOT}/tunnel.service"
+  grep -Fqx 'Requires=nginx.service' "${TEST_ROOT}/tunnel.service"
+  grep -Fqx 'After=network-online.target nginx.service edge-router.service' "${TEST_ROOT}/tunnel.service"
+  if grep -Eq '^(Requires|Requisite|BindsTo|PartOf)=.*edge-router' "${TEST_ROOT}/tunnel.service"; then
+    fail 'core shutdown can stop the static-site tunnel'
+  fi
+}
+
 mock_listener_audit() {
   ss() {
     assert_equal "$*" '-H -lntp'
@@ -878,7 +888,7 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_port_preflight_free test_port_preflight_owned test_port_preflight_conflicts \
   test_port_preflight_errors test_port_preflight_modes \
   test_choose_port_free test_choose_port_failure test_choose_port_exhausted \
-  test_large_cloudflared_help test_broken_cloudflared test_tunnel_metrics_private \
+  test_large_cloudflared_help test_broken_cloudflared test_tunnel_metrics_private test_tunnel_core_independent \
   test_listener_audit_loopback test_listener_audit_exposure test_listener_audit_direct \
   test_listener_audit_unrelated test_listener_audit_unavailable test_websocket_upgrade \
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \

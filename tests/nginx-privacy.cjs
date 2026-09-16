@@ -18,6 +18,7 @@ const wsPath = '/service/0123456789abcdef';
 let child;
 let backend;
 let failureCode = 0;
+let dropHandshake = false;
 let hits = 0;
 const sockets = new Set();
 
@@ -69,6 +70,12 @@ async function stopNginx() {
     const timer = setTimeout(() => current.kill('SIGKILL'), 3000);
     try { await stopped; } finally { clearTimeout(timer); }
   }
+}
+
+async function stopBackend() {
+  const closed = backend && backend.listening ? new Promise(resolve => backend.close(resolve)) : Promise.resolve();
+  for (const socket of sockets) socket.destroy();
+  await closed;
 }
 
 async function checkMode(mode) {
@@ -166,7 +173,7 @@ async function checkMode(mode) {
     }
     assert.equal(hits, before, 'incomplete handshake reached backend');
   }
-  for (const code of [400, 403, 404, 405, 426, 500, 502, 503, 504]) {
+  for (const code of [301, 302, 303, 307, 308, 400, 403, 404, 405, 426, 500, 502, 503, 504]) {
     failureCode = code;
     const before = hits;
     const res = await request(mode, port, wsPath, { headers: validHeaders });
@@ -175,9 +182,27 @@ async function checkMode(mode) {
     assert.equal(res.body, baseline.body, `upstream body ${code}`);
     assert.equal(res.headers['x-powered-by'], undefined, 'backend implementation header leaked');
     assert.equal(res.headers['sec-websocket-version'], undefined, 'backend protocol error header leaked');
+    assert.equal(res.headers.location, undefined, 'backend redirect exposed an internal address');
     assert.ok(!JSON.stringify(res.headers).includes('backend-build-sentinel'));
   }
   failureCode = 0;
+  dropHandshake = true;
+  const beforeDisconnect = hits;
+  const disconnected = await request(mode, port, wsPath, { headers: validHeaders });
+  assert.equal(hits, beforeDisconnect + 1, 'disconnect fixture was not exercised');
+  assert.equal(disconnected.status, 404, 'upstream disconnect exposed a gateway error');
+  assert.equal(disconnected.body, baseline.body);
+  dropHandshake = false;
+
+  const backendPort = backend.address().port;
+  await stopBackend();
+  const offline = await request(mode, port, wsPath, { headers: validHeaders });
+  assert.equal(offline.status, 404, 'connection refusal exposed a gateway error');
+  assert.equal(offline.body, baseline.body);
+  assert.equal(offline.headers.location, undefined);
+  assert.equal((await request(mode, port, '/')).status, 200, 'backend outage took down the static site');
+  backend.listen(backendPort, '127.0.0.1');
+  await once(backend, 'listening');
   for (const [index, connection] of ['Upgrade', 'keep-alive, Upgrade', 'Upgrade, keep-alive',
     'keep-alive , \tUpGrAdE , close'].entries()) {
     const key = index === 0 ? validHeaders['Sec-WebSocket-Key'] :
@@ -208,7 +233,7 @@ async function checkMode(mode) {
   for (const value of [wsPath, 'private-query-sentinel', 'private-referrer-sentinel']) {
     assert.ok(!log.includes(value), `access log contains ${value}`);
   }
-  console.log(`PASS real nginx ${mode}: private files/staging, no listing, uniform 404/headers, ${invalidRequests.length} blocked handshakes, valid WebSocket variants`);
+  console.log(`PASS real nginx ${mode}: private files/staging, no listing, uniform errors/redirects, backend outage/recovery, ${invalidRequests.length} blocked handshakes, valid WebSocket variants`);
 }
 
 (async () => {
@@ -229,11 +254,14 @@ async function checkMode(mode) {
     backend.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
     backend.on('upgrade', (req, socket) => {
       hits++;
+      if (dropHandshake) { socket.destroy(); return; }
       if (failureCode || !req.headers['sec-websocket-key']) {
         const body = 'backend-detail-sentinel';
+        const redirect = failureCode >= 300 && failureCode < 400 ?
+          `Location: http://127.0.0.1:${backend.address().port}/internal-redirect-sentinel\r\n` : '';
         socket.end(`HTTP/1.1 ${failureCode || 400} Failure\r\nContent-Length: ${Buffer.byteLength(body)}\r\n` +
           'Server: backend-build-sentinel\r\nX-Powered-By: backend-library-sentinel\r\n' +
-          `Sec-WebSocket-Version: 13\r\n\r\n${body}`);
+          `Sec-WebSocket-Version: 13\r\n${redirect}\r\n${body}`);
         return;
       }
       const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] +
@@ -250,8 +278,7 @@ async function checkMode(mode) {
     process.exitCode = 1;
   } finally {
     await stopNginx();
-    for (const socket of sockets) socket.destroy();
-    if (backend) await new Promise(resolve => backend.close(resolve));
+    await stopBackend();
     // Only remove the exact private directory created by this test.
     fs.rmSync(root, { recursive: true, force: true });
   }

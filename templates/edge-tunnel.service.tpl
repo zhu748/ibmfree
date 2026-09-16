@@ -1,8 +1,8 @@
 [Unit]
 Description=Application edge connector
 After=network-online.target nginx.service edge-router.service
-Wants=network-online.target
-Requires=nginx.service edge-router.service
+Wants=network-online.target edge-router.service
+Requires=nginx.service
 
 [Service]
 Type=simple

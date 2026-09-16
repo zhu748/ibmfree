@@ -17,7 +17,7 @@ const site = path.join(root, 'site');
 const wsPath = '/service/0123456789abcdef';
 let child;
 let backend;
-let failureCode = 400;
+let failureCode = 0;
 let hits = 0;
 const sockets = new Set();
 
@@ -129,21 +129,67 @@ async function checkMode(mode) {
   const asset = await request(mode, port, '/assets/public.txt');
   assert.equal(asset.status, 200, 'turning off listings blocked normal static assets');
   assert.equal(asset.body, 'public-asset-sentinel');
-  const before = hits;
-  const blocked = await request(mode, port, wsPath, { method: 'POST', headers: { Upgrade: 'websocket' } });
-  assert.equal(blocked.status, 404);
-  assert.equal(hits, before, 'invalid request reached backend');
-  const badHeaders = { Connection: 'Upgrade', Upgrade: 'websocket' };
+  const validHeaders = { Connection: 'Upgrade', Upgrade: 'websocket',
+    'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' };
+  for (const [uri, host] of [['/missing', 'edge.example.com'], [wsPath, 'unknown.example.com']]) {
+    const before = hits;
+    const res = await request(mode, port, uri, { headers: { ...validHeaders, Host: host } });
+    assert.equal(res.status, 404, 'complete handshake bypassed Host/path routing');
+    assert.equal(res.body, baseline.body);
+    assert.equal(hits, before, 'unknown Host/path reached backend');
+  }
+  const invalidRequests = ['POST', 'PUT', 'OPTIONS', 'HEAD'].map(method => ({ method, headers: validHeaders }));
+  for (const [field, value] of [
+    ['Connection', null], ['Connection', 'close'], ['Connection', 'keep-alive, not-upgrade'],
+    ['Connection', 'keep-alive upgrade'], ['Upgrade', null], ['Upgrade', 'h2c'],
+    ['Sec-WebSocket-Version', null], ['Sec-WebSocket-Version', '12'], ['Sec-WebSocket-Version', '13, 8'],
+    ['Sec-WebSocket-Key', null], ['Sec-WebSocket-Key', ''], ['Sec-WebSocket-Key', 'not-base64'],
+    ['Sec-WebSocket-Key', Buffer.alloc(15).toString('base64')],
+    ['Sec-WebSocket-Key', Buffer.alloc(17).toString('base64')],
+    ['Sec-WebSocket-Key', '!!!!!!!!!!!!!!!!!!!!!!=='],
+  ]) {
+    const headers = { ...validHeaders, [field]: value };
+    if (value === null) delete headers[field];
+    invalidRequests.push({ headers });
+  }
+  for (const options of invalidRequests) {
+    const before = hits;
+    const ordinary = await request(mode, port, '/missing', options);
+    const blocked = await request(mode, port, wsPath, options);
+    assert.equal(blocked.status, 404, JSON.stringify(options));
+    assert.equal(blocked.body, ordinary.body, 'invalid handshake differs from ordinary missing resource');
+    for (const name of ['content-type', 'content-length']) {
+      assert.equal(blocked.headers[name], ordinary.headers[name], `invalid handshake leaks via ${name}`);
+    }
+    for (const name of ['sec-websocket-accept', 'sec-websocket-version', 'upgrade']) {
+      assert.equal(blocked.headers[name], undefined, `invalid handshake leaks ${name}`);
+    }
+    assert.equal(hits, before, 'incomplete handshake reached backend');
+  }
   for (const code of [400, 403, 404, 405, 426, 500, 502, 503, 504]) {
     failureCode = code;
-    const res = await request(mode, port, wsPath, { headers: badHeaders });
+    const before = hits;
+    const res = await request(mode, port, wsPath, { headers: validHeaders });
+    assert.equal(hits, before + 1, 'upstream-error test did not reach backend');
     assert.equal(res.status, 404, `upstream status ${code}`);
     assert.equal(res.body, baseline.body, `upstream body ${code}`);
+    assert.equal(res.headers['x-powered-by'], undefined, 'backend implementation header leaked');
+    assert.equal(res.headers['sec-websocket-version'], undefined, 'backend protocol error header leaked');
+    assert.ok(!JSON.stringify(res.headers).includes('backend-build-sentinel'));
   }
-  const valid = await request(mode, port, wsPath, { headers: { ...badHeaders,
-    'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==' } });
-  assert.equal(valid.status, 101, 'valid WebSocket no longer works');
-  assert.equal(valid.headers['sec-websocket-accept'], 's3pPLMBiTxaQ9kYGzzhZRbK+xOo=');
+  failureCode = 0;
+  for (const [index, connection] of ['Upgrade', 'keep-alive, Upgrade', 'Upgrade, keep-alive',
+    'keep-alive , \tUpGrAdE , close'].entries()) {
+    const key = index === 0 ? validHeaders['Sec-WebSocket-Key'] :
+      (index === 1 ? Buffer.alloc(16, 255) : crypto.randomBytes(16)).toString('base64');
+    const before = hits;
+    const valid = await request(mode, port, wsPath, { headers: { ...validHeaders,
+      Connection: connection, Upgrade: 'WebSocket', 'Sec-WebSocket-Key': key } });
+    assert.equal(valid.status, 101, `valid WebSocket rejected: ${connection}`);
+    assert.equal(valid.headers['sec-websocket-accept'], crypto.createHash('sha1')
+      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64'));
+    assert.equal(hits, before + 1, 'valid handshake did not reach backend');
+  }
   await request(mode, port, '/missing?token=private-query-sentinel', {
     headers: { Referer: 'https://example.com/private-referrer-sentinel' },
   });
@@ -162,7 +208,7 @@ async function checkMode(mode) {
   for (const value of [wsPath, 'private-query-sentinel', 'private-referrer-sentinel']) {
     assert.ok(!log.includes(value), `access log contains ${value}`);
   }
-  console.log(`PASS real nginx ${mode}: private files/staging, no inherited listing, uniform 404, redirects, access-log privacy, WebSocket 101`);
+  console.log(`PASS real nginx ${mode}: private files/staging, no listing, uniform 404/headers, ${invalidRequests.length} blocked handshakes, valid WebSocket variants`);
 }
 
 (async () => {
@@ -179,12 +225,15 @@ async function checkMode(mode) {
     }
     run('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
       '-subj', '/CN=edge.example.com', '-keyout', path.join(root, 'key.pem'), '-out', path.join(root, 'cert.pem')]);
-    backend = http.createServer((req, res) => { hits++; res.writeHead(failureCode); res.end('backend-detail-sentinel'); });
+    backend = http.createServer((req, res) => { hits++; res.writeHead(failureCode || 400); res.end('backend-detail-sentinel'); });
     backend.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
     backend.on('upgrade', (req, socket) => {
       hits++;
-      if (!req.headers['sec-websocket-key']) {
-        socket.end(`HTTP/1.1 ${failureCode} Failure\r\nContent-Length: 23\r\n\r\nbackend-detail-sentinel`);
+      if (failureCode || !req.headers['sec-websocket-key']) {
+        const body = 'backend-detail-sentinel';
+        socket.end(`HTTP/1.1 ${failureCode || 400} Failure\r\nContent-Length: ${Buffer.byteLength(body)}\r\n` +
+          'Server: backend-build-sentinel\r\nX-Powered-By: backend-library-sentinel\r\n' +
+          `Sec-WebSocket-Version: 13\r\n\r\n${body}`);
         return;
       }
       const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] +

@@ -121,6 +121,8 @@ curl -I https://edge.example.com/
 
 本项目的站点对未找到页面、受保护文件和 WebSocket 上游错误返回相同的 404 正文；有效 WebSocket 升级仍返回 101。目录跳转使用相对地址，不携带内部 HTTP scheme 和 8001 端口。重装默认保留现有首页，只有首次安装或显式提供 `SITE_INDEX_FILE` 时才生成／替换；用户自己的真实静态页面比统一模板更适合公开展示。
 
+秘密路径仅在基础 WebSocket 握手字段完整时转发：GET、Upgrade 为 websocket、Connection 包含 Upgrade、版本为 13、Key 为 16 字节 nonce 的 Base64 形式；可解析的 HTTP 请求中，这些字段缺失或校验失败时在 Nginx 层返回普通 404，不交给核心生成协议错误。检查允许合法的大小写和 Connection 多 token 写法，不增加 User-Agent／Origin 限制。这不是 VMess 身份认证：完整握手仍可返回 101，之后由核心校验 UUID；路径和 UUID 仍需保密。
+
 站点显式关闭目录列表，即使 VPS 的 Nginx 全局启用了 `autoindex`，无首页的目录也返回统一 404，不展示目录内文件名、大小和时间。普通静态资源仍可按路径访问；`.edge-stage.*` 暂存目录同时由文件权限和隐藏路径规则保护。
 
 访问日志仅保留时间、方法、状态、字节数和耗时，不记录 URL／查询串／Referer。错误日志仍保留用于排障，可能包含请求路径；系统管理员、Cloudflare 和 VPS 提供方仍可能观察到相关信息。本项目不会清除系统审计或保证规避流量识别。

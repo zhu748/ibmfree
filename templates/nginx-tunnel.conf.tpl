@@ -3,9 +3,20 @@ map $http_upgrade $edge_connection_upgrade {
     ''      close;
 }
 
-map "$request_method:$http_upgrade" $edge_websocket_request {
-    default             0;
-    ~*^GET:websocket$   1;
+map $http_connection $edge_websocket_connection {
+    default 0;
+    ~*(^|,)[[:space:]]*upgrade[[:space:]]*(,|$) 1;
+}
+
+map $http_sec_websocket_key $edge_websocket_key {
+    default 0;
+    "~^[A-Za-z0-9+/]{22}==$" 1;
+}
+
+# Validate handshake structure only; VMess authentication remains in the core.
+map "$request_method:$http_upgrade:$edge_websocket_connection:$edge_websocket_key:$http_sec_websocket_version" $edge_websocket_request {
+    default 0;
+    "~^GET:(?i:websocket):1:1:13$" 1;
 }
 
 log_format edge_minimal '$time_iso8601 $request_method $status $body_bytes_sent $request_time';

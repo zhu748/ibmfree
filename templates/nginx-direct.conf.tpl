@@ -51,6 +51,7 @@ server {
 
     root {{SITE_ROOT}};
     index index.html;
+    autoindex off;
 
     location = {{WS_PATH}} {
         if ($edge_websocket_request = 0) { return 404; }

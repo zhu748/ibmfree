@@ -22,8 +22,9 @@ source "${FIXTURE_ROOT}/installer.sh"
 systemctl() { die 'test fixture must not manage system services'; }
 download_file() { die 'test fixture must not download files'; }
 install() {
-  [[ $* == "-o root -g root -m 0600 /dev/stdin ${CLIENT_PATH}" ]] || die 'unexpected fixture install'
-  command install -m 0600 /dev/stdin "$CLIENT_PATH"
+  [[ $# == 8 && $1 == -o && $2 == root && $3 == -g && $4 == root && $5 == -m &&
+    $6 == 0600 && $7 == /dev/stdin && $8 == "${CONFIG_DIR}/.edge-stage."*/payload ]] || die 'unexpected fixture install'
+  command install -m 0600 /dev/stdin "$8"
 }
 
 CUSTOM_UUID=11111111-1111-4111-8111-111111111111

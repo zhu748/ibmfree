@@ -331,7 +331,7 @@ install_cloudflared_s390x() {
 
   install -d -o root -g root -m 0755 "$(dirname "$CLOUDFLARED_INSTALL_PATH")"
   backup_file "$CLOUDFLARED_INSTALL_PATH"
-  install -o root -g root -m 0755 "$binary" "$CLOUDFLARED_INSTALL_PATH"
+  install_managed_file root root 0755 "$binary" "$CLOUDFLARED_INSTALL_PATH"
   CLOUDFLARED_BIN=$CLOUDFLARED_INSTALL_PATH
   success "cloudflared s390x 发布包校验并安装完成。"
 }
@@ -511,20 +511,35 @@ restore_service_state() {
   fi
 }
 
-restore_backup_file() {
+cleanup_file_stage() {
+  local exit_code=$?
+  local directory=$1
+  trap - EXIT ERR INT TERM
+  if [[ -n $directory ]]; then
+    # Only this operation's payload and now-empty directory may be removed.
+    rm -f -- "${directory}/payload" || warn "暂存文件清理失败: ${directory}/payload"
+    rmdir -- "$directory" || warn "暂存目录保留，请检查: ${directory}"
+  fi
+  exit "$exit_code"
+}
+
+restore_backup_file() (
   local backup=$1
   local target=$2
-  local staged=""
+  local stage_dir=""
+  trap - ERR
+  trap 'cleanup_file_stage "$stage_dir"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  # Keep the live file intact until a same-directory backup copy is ready.
-  staged=$(mktemp "${target}.restore.XXXXXXXX") || return 1
-  if cp --archive --no-dereference --remove-destination --no-target-directory "$backup" "$staged" &&
-    mv --force --no-target-directory "$staged" "$target"; then
-    return 0
-  fi
-  rm -f -- "$staged"
-  return 1
-}
+  [[ -f $backup || -L $backup ]] || return 1
+  [[ $target == /* && $target != */ ]] || return 1
+  # The private directory keeps even public-site rollback payloads unreadable.
+  stage_dir=$(mktemp -d "${target%/*}/.edge-stage.XXXXXXXX") || return 1
+  cp --archive --no-dereference --remove-destination --no-target-directory \
+    "$backup" "${stage_dir}/payload" || return 1
+  mv --force --no-target-directory -- "${stage_dir}/payload" "$target"
+)
 
 rollback_installation() {
   local index target backup
@@ -570,6 +585,7 @@ rollback_installation() {
 backup_file() {
   local path=$1
   local backup="" existing_target
+  [[ ! -e $path || -f $path || -L $path ]] || die "托管文件路径不是普通文件或符号链接: ${path}"
   for existing_target in "${ROLLBACK_TARGETS[@]}"; do
     [[ $existing_target != "$path" ]] || return 0
   done
@@ -590,20 +606,25 @@ backup_file() {
   ROLLBACK_ACTIVE=true
 }
 
-install_managed_file() {
+install_managed_file() (
   local owner=$1
   local group=$2
   local mode=$3
   local source=$4
   local destination=$5
+  local stage_dir=""
+  trap - ERR
+  trap 'cleanup_file_stage "$stage_dir"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  if [[ -e $destination && $source -ef $destination ]]; then
-    chown "$owner:$group" "$destination"
-    chmod "$mode" "$destination"
-  else
-    install -o "$owner" -g "$group" -m "$mode" "$source" "$destination"
-  fi
-}
+  [[ $destination == /* && $destination != */ ]] || return 1
+  [[ ! -e $destination || -f $destination || -L $destination ]] || return 1
+  stage_dir=$(mktemp -d "${destination%/*}/.edge-stage.XXXXXXXX") || return 1
+  install -o "$owner" -g "$group" -m "$mode" "$source" "${stage_dir}/payload" || return 1
+  # Same-filesystem rename also supports source == destination and live binaries.
+  mv --force --no-target-directory -- "${stage_dir}/payload" "$destination"
+)
 
 install_sing_box() {
   local arch expected_hash actual_hash archive extract_dir source_bin url
@@ -627,7 +648,7 @@ install_sing_box() {
 
   install -d -m 0755 "$(dirname "$SING_BOX_BIN")"
   backup_file "$SING_BOX_BIN"
-  install -o root -g root -m 0755 "$source_bin" "$SING_BOX_BIN"
+  install_managed_file root root 0755 "$source_bin" "$SING_BOX_BIN"
   success "sing-box 官方发布包校验并安装完成。"
 }
 
@@ -704,10 +725,10 @@ write_configuration() {
   backup_file "$NGINX_CONFIG"
   backup_file "${SITE_ROOT}/index.html"
   backup_file "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
-  install -o root -g edge-router -m 0640 "$rendered_config" "$CONFIG_PATH"
-  install -o root -g root -m 0644 "$rendered_nginx" "$NGINX_CONFIG"
-  install -o root -g root -m 0644 "$rendered_site" "${SITE_ROOT}/index.html"
-  install -o root -g root -m 0644 "$rendered_service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+  install_managed_file root edge-router 0640 "$rendered_config" "$CONFIG_PATH"
+  install_managed_file root root 0644 "$rendered_nginx" "$NGINX_CONFIG"
+  install_managed_file root root 0644 "$rendered_site" "${SITE_ROOT}/index.html"
+  install_managed_file root root 0644 "$rendered_service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 
   if [[ $DEPLOY_MODE == "direct" ]]; then
     install -d -o root -g root -m 0700 "${CONFIG_DIR}/tls"
@@ -720,7 +741,7 @@ write_configuration() {
     install_managed_file edge-router edge-router 0400 "$TUNNEL_TOKEN_FILE" "$TOKEN_PATH"
     render_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl" "$rendered_tunnel"
     backup_file "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
-    install -o root -g root -m 0644 "$rendered_tunnel" "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
+    install_managed_file root root 0644 "$rendered_tunnel" "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
   fi
 }
 
@@ -732,7 +753,7 @@ write_client_link() {
     "$PUBLIC_DOMAIN" "$PUBLIC_DOMAIN" "$CUSTOM_UUID" "$PUBLIC_DOMAIN" "$WS_PATH" "$PUBLIC_DOMAIN")
   encoded_link=$(printf '%s' "$client_json" | base64 | tr -d '\r\n')
   backup_file "$CLIENT_PATH"
-  printf 'vmess://%s\n' "$encoded_link" | install -o root -g root -m 0600 /dev/stdin "$CLIENT_PATH"
+  printf 'vmess://%s\n' "$encoded_link" | install_managed_file root root 0600 /dev/stdin "$CLIENT_PATH"
 }
 
 local_http_request() {

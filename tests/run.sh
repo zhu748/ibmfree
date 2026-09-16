@@ -416,6 +416,153 @@ test_missing_backup() {
   assert_equal "$(<"$file")" current
 }
 
+assert_no_file_stages() {
+  [[ -z $(find "$TEST_ROOT" -name '.edge-stage.*' -print) ]] || fail 'private staging directory left behind'
+}
+
+mock_file_install() {
+  install() {
+    [[ $# == 8 && $1 == -o && $3 == -g && $5 == -m &&
+      $8 == "${TEST_ROOT}/"* && $8 == */.edge-stage.*/payload ]] || fail 'unexpected file installation'
+    if [[ $(uname -s) == Linux ]]; then
+      assert_equal "$(stat -c '%a' "${8%/*}")" 700
+    fi
+    command install -m "$6" -- "$7" "$8"
+  }
+}
+
+test_atomic_install() {
+  local source="${TEST_ROOT}/source" file="${TEST_ROOT}/live"
+  printf complete >"$source"
+  printf original >"$file"
+  mock_file_install
+  mv() {
+    assert_equal "$(<"$file")" original
+    assert_equal "$(<"$4")" complete
+    assert_equal "$5" "$file"
+    if [[ $(uname -s) == Linux ]]; then assert_equal "$(stat -c '%a' "$4")" 640; fi
+    command mv "$@"
+  }
+  install_managed_file root root 0640 "$source" "$file"
+  assert_equal "$(<"$file")" complete
+  assert_no_file_stages
+}
+
+test_atomic_install_copy_failure() {
+  local source="${TEST_ROOT}/source" file="${TEST_ROOT}/live"
+  printf complete >"$source"
+  printf original >"$file"
+  install() { printf partial >"${@: -1}"; return 1; }
+  if install_managed_file root root 0644 "$source" "$file"; then fail 'partial copy accepted'; fi
+  assert_equal "$(<"$file")" original
+  if install_managed_file root root 0644 "$source" "${TEST_ROOT}/new"; then fail 'partial new file accepted'; fi
+  [[ ! -e ${TEST_ROOT}/new ]] || fail 'partial new file published'
+  assert_no_file_stages
+}
+
+test_atomic_install_rename_failure() {
+  local source="${TEST_ROOT}/source" file="${TEST_ROOT}/live"
+  printf complete >"$source"
+  printf original >"$file"
+  mock_file_install
+  mv() { return 1; }
+  if install_managed_file root root 0644 "$source" "$file"; then fail 'failed rename accepted'; fi
+  assert_equal "$(<"$file")" original
+  assert_no_file_stages
+}
+
+test_atomic_install_stage_failure() {
+  local file="${TEST_ROOT}/live"
+  printf original >"$file"
+  mktemp() { return 1; }
+  if install_managed_file root root 0644 "$file" "$file"; then fail 'failed staging allocation accepted'; fi
+  assert_equal "$(<"$file")" original
+  assert_no_file_stages
+}
+
+test_atomic_install_same_file() {
+  local file="${TEST_ROOT}/live"
+  printf original >"$file"
+  mock_file_install
+  install_managed_file root root 0600 "$file" "$file"
+  assert_equal "$(<"$file")" original
+  if [[ $(uname -s) == Linux ]]; then assert_equal "$(stat -c '%a' "$file")" 600; fi
+  assert_no_file_stages
+}
+
+test_atomic_install_signals() {
+  local file="${TEST_ROOT}/live" signal expected status
+  printf original >"$file"
+  install() { printf partial >"${@: -1}"; kill -"$signal" "$BASHPID"; fail 'signal ignored'; }
+  for signal in INT TERM; do
+    status=0
+    expected=130
+    [[ $signal != TERM ]] || expected=143
+    install_managed_file root root 0644 "$file" "$file" || status=$?
+    assert_equal "$status" "$expected"
+    assert_equal "$(<"$file")" original
+    assert_no_file_stages
+  done
+}
+
+test_managed_directory_rejected() {
+  mkdir "${TEST_ROOT}/directory"
+  printf retained >"${TEST_ROOT}/directory/content"
+  if (backup_file "${TEST_ROOT}/directory") >"${TEST_ROOT}/error" 2>&1; then
+    fail 'managed directory accepted as a file'
+  fi
+  grep -q '托管文件路径不是普通文件' "${TEST_ROOT}/error"
+  if install_managed_file root root 0644 /dev/null "${TEST_ROOT}/directory"; then
+    fail 'directory accepted as atomic destination'
+  fi
+  assert_equal "$(<"${TEST_ROOT}/directory/content")" retained
+  assert_no_file_stages
+}
+
+test_atomic_install_symlink() {
+  if [[ $(uname -s) != Linux ]]; then
+    printf 'SKIP: native symlink semantics require Linux (covered by CI)\n'
+    return 77
+  fi
+  local file="${TEST_ROOT}/live" outside="${TEST_ROOT}/outside" source="${TEST_ROOT}/source"
+  printf external >"$outside"
+  printf complete >"$source"
+  ln -s "$outside" "$file"
+  backup_file "$file"
+  mock_file_install
+  install_managed_file root root 0644 "$source" "$file"
+  [[ ! -L $file ]] || fail 'new file still follows old target symlink'
+  assert_equal "$(<"$outside")" external
+  assert_equal "$(<"$file")" complete
+  restore_backup_file "${ROLLBACK_BACKUPS[0]}" "$file"
+  [[ -L $file ]] || fail 'original symlink not restored'
+  assert_equal "$(readlink "$file")" "$outside"
+  assert_equal "$(<"$outside")" external
+  assert_no_file_stages
+}
+
+test_atomic_install_running_binary() {
+  if [[ $(uname -s) != Linux ]]; then
+    printf 'SKIP: live executable replacement requires Linux (covered by CI)\n'
+    return 77
+  fi
+  local file="${TEST_ROOT}/live" pid attempt
+  cp "$(type -P sleep)" "$file"
+  "$file" 30 &
+  pid=$!
+  trap "kill $pid 2>/dev/null || true; wait $pid 2>/dev/null || true" EXIT
+  for attempt in {1..20}; do
+    [[ /proc/${pid}/exe -ef $file ]] && break
+    command sleep 0.05
+  done
+  [[ /proc/${pid}/exe -ef $file ]] || fail 'fixture executable did not start'
+  mock_file_install
+  install_managed_file root root 0755 "$(type -P true)" "$file"
+  kill -0 "$pid" || fail 'updating executable stopped existing process'
+  "$file"
+  assert_no_file_stages
+}
+
 test_atomic_restore_copy_failure() {
   local file="${TEST_ROOT}/original"
   printf original >"$file"
@@ -427,7 +574,32 @@ test_atomic_restore_copy_failure() {
   fi
   assert_equal "$(<"$file")" modified
   assert_equal "$(<"${ROLLBACK_BACKUPS[0]}")" original
-  [[ -z $(find "$TEST_ROOT" -name '*.restore.*' -print) ]] || fail 'staging file left behind'
+  assert_no_file_stages
+}
+
+test_atomic_restore_rename_failure() {
+  local file="${TEST_ROOT}/live"
+  printf original >"$file"
+  backup_file "$file"
+  printf modified >"$file"
+  mv() { return 1; }
+  if restore_backup_file "${ROLLBACK_BACKUPS[0]}" "$file"; then fail 'failed restore rename accepted'; fi
+  assert_equal "$(<"$file")" modified
+  assert_equal "$(<"${ROLLBACK_BACKUPS[0]}")" original
+  assert_no_file_stages
+}
+
+test_atomic_restore_signal() {
+  local file="${TEST_ROOT}/live" status=0
+  printf original >"$file"
+  backup_file "$file"
+  printf modified >"$file"
+  cp() { printf partial >"${@: -1}"; kill -TERM "$BASHPID"; fail 'signal ignored'; }
+  restore_backup_file "${ROLLBACK_BACKUPS[0]}" "$file" || status=$?
+  assert_equal "$status" 143
+  assert_equal "$(<"$file")" modified
+  assert_equal "$(<"${ROLLBACK_BACKUPS[0]}")" original
+  assert_no_file_stages
 }
 
 test_rollback_restores_files() {
@@ -502,7 +674,7 @@ test_render_config() {
 
 test_client_link() {
   collect_configuration <<<''
-  install() { cat >"${@: -1}"; }
+  mock_file_install
   write_client_link
   node -e 'const fs=require("fs"),assert=require("assert/strict"); const link=fs.readFileSync(process.argv[1],"utf8").trim(); assert.ok(link.startsWith("vmess://")); const c=JSON.parse(Buffer.from(link.slice(8),"base64").toString("utf8")); assert.equal(c.id,"11111111-1111-4111-8111-111111111111"); assert.equal(c.add,"edge.example.com"); assert.equal(c.path,Buffer.from(process.argv[2],"base64").toString("utf8")); assert.equal(c.net,"ws"); assert.equal(c.tls,"tls"); assert.equal(c.port,"443"); assert.ok(!JSON.stringify(c).includes("test-only-token"));' "$CLIENT_PATH" "$(printf '%s' "$WS_PATH" | base64 | tr -d '\r\n')"
 }
@@ -632,7 +804,11 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_large_cloudflared_help test_broken_cloudflared test_websocket_upgrade \
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \
   test_backup_once test_site_preserved test_site_no_deployment_marker test_site_backup_private \
-  test_missing_backup test_atomic_restore_copy_failure test_rollback_restores_files \
+  test_atomic_install test_atomic_install_copy_failure test_atomic_install_rename_failure \
+  test_atomic_install_stage_failure test_atomic_install_same_file test_atomic_install_signals \
+  test_managed_directory_rejected test_atomic_install_symlink test_atomic_install_running_binary \
+  test_missing_backup test_atomic_restore_copy_failure test_atomic_restore_rename_failure \
+  test_atomic_restore_signal test_rollback_restores_files \
   test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link test_vmess_fixture \
   test_real_http test_real_socket_preflight \
   test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do

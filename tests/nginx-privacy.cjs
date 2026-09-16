@@ -93,7 +93,7 @@ async function checkMode(mode) {
       .replace(/listen 443 /g, `listen 127.0.0.1:${port} `);
   }
   fs.writeFileSync(conf, `worker_processes 1;\npid ${root}/${mode}.pid;\n` +
-    `error_log ${error} warn;\nevents { worker_connections 128; }\nhttp {\n` +
+    `error_log ${error} warn;\nevents { worker_connections 128; }\nhttp {\nautoindex on;\n` +
     `client_body_temp_path ${root}/client;\nproxy_temp_path ${root}/proxy;\n${template}\n}\n`, 'utf8');
   run('nginx', ['-p', root + '/', '-c', conf, '-t']);
   let stderr = '';
@@ -110,7 +110,8 @@ async function checkMode(mode) {
   assert.equal(baseline.status, 404);
   assert.ok(!/nginx|sing-box|vmess|edge-router/i.test(baseline.body));
   const privatePaths = ['/index.html.bak.20260101', '/index.html.restore.test', '/config.json',
-    '/client.txt', '/tunnel.token', '/.git/config', '/%2egit/config', '/index.html~'];
+    '/client.txt', '/tunnel.token', '/.git/config', '/%2egit/config', '/index.html~',
+    '/.edge-stage.fixture/payload', '/%2eedge-stage.fixture/payload'];
   for (const uri of [...privatePaths, wsPath]) {
     const res = await request(mode, port, uri);
     assert.equal(res.status, 404, uri);
@@ -122,6 +123,12 @@ async function checkMode(mode) {
   const redirect = await request(mode, port, '/assets');
   assert.equal(redirect.status, 301);
   assert.equal(redirect.headers.location, '/assets/');
+  const directory = await request(mode, port, '/assets/');
+  assert.equal(directory.status, 404, 'global autoindex setting exposed a directory listing');
+  assert.equal(directory.body, baseline.body);
+  const asset = await request(mode, port, '/assets/public.txt');
+  assert.equal(asset.status, 200, 'turning off listings blocked normal static assets');
+  assert.equal(asset.body, 'public-asset-sentinel');
   const before = hits;
   const blocked = await request(mode, port, wsPath, { method: 'POST', headers: { Upgrade: 'websocket' } });
   assert.equal(blocked.status, 404);
@@ -155,7 +162,7 @@ async function checkMode(mode) {
   for (const value of [wsPath, 'private-query-sentinel', 'private-referrer-sentinel']) {
     assert.ok(!log.includes(value), `access log contains ${value}`);
   }
-  console.log(`PASS real nginx ${mode}: private files, uniform 404, relative redirects, access-log privacy, WebSocket 101`);
+  console.log(`PASS real nginx ${mode}: private files/staging, no inherited listing, uniform 404, redirects, access-log privacy, WebSocket 101`);
 }
 
 (async () => {
@@ -163,9 +170,11 @@ async function checkMode(mode) {
     fs.mkdirSync(path.join(root, 'logs'));
     fs.mkdirSync(path.join(site, 'assets'), { recursive: true });
     fs.mkdirSync(path.join(site, '.git'));
+    fs.mkdirSync(path.join(site, '.edge-stage.fixture'));
     fs.writeFileSync(path.join(site, 'index.html'), '<html>fixture site</html>', 'utf8');
+    fs.writeFileSync(path.join(site, 'assets/public.txt'), 'public-asset-sentinel', 'utf8');
     for (const name of ['index.html.bak.20260101', 'index.html.restore.test', 'config.json',
-      'client.txt', 'tunnel.token', 'index.html~', '.git/config']) {
+      'client.txt', 'tunnel.token', 'index.html~', '.git/config', '.edge-stage.fixture/payload']) {
       fs.writeFileSync(path.join(site, name), 'private-content-sentinel', 'utf8');
     }
     run('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',

@@ -36,7 +36,7 @@ XHTTP 固定使用 `packet-up`，Nginx 关闭请求和响应缓冲、允许随�
 
 适合使用 Cloudflare Tunnel 的环境。公网 TLS 在 Cloudflare 终止，Nginx 只监听 `127.0.0.1:8001`。
 
-Cloudflare 官方没有提供 s390x 发布资产，因此本仓库通过 GitHub Actions 从固定的官方源码提交构建并发布。安装器会自动下载和校验，不需要手工上传二进制。
+Cloudflare 官方没有提供 s390x 发布资产，因此本仓库通过 GitHub Actions 从固定的官方源码提交构建并发布；amd64 与 arm64 直接使用 Cloudflare 官方发布资产。两条路径都按固定版本下载并校验 SHA-256，不需要手工上传二进制。
 
 在 Cloudflare Tunnel 的 Published application 中，将公网域名映射到：
 
@@ -58,16 +58,22 @@ Tunnel 会按顺序拉起核心，但不再与核心单独停止的操作联动�
 
 ## 安装
 
-先在 Cloudflare Tunnel 中将 Published application 设置为 `http://127.0.0.1:8001`，然后在 s390x VPS 上切换到 root：
+先在 Cloudflare Tunnel 中将 Published application 设置为 `http://127.0.0.1:8001`，然后在 VPS 上切换到 root：
 
 ```bash
 sudo -i
 ```
 
-执行一条命令：
+s390x（IBM LinuxONE）VPS 使用原有的一条命令：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstrap.sh)
+```
+
+x86_64/AMD64 与 ARM64 VPS 使用另一条独立命令，与上面的 s390x 入口互不影响（新入口在 s390x 上会拒绝执行并提示改用原命令）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/zhu748/ibmfree/main/bootstrap-vps.sh)
 ```
 
 安装器会要求代理方案、UUID（可留空自动生成）、公网域名和 Cloudflare Tunnel Token。完成后按所选方案打印 `vmess://` 或 `vless://` 链接。重复安装时会复用现有 UUID、路径和内部端口。切换方案会改变协议/传输，请重新导入输出的链接；保留 UUID 不代表原链接能跨方案使用。引导脚本会下载完整仓库归档，正式安装仍由仓库中的模板化安装器执行。
@@ -205,7 +211,7 @@ WS/XHTTP 代理位置会过滤上游 Server、X-Powered-By、X-Runtime、X-AspNe
 
 ## 开发验证
 
-仓库包含隔离的回归测试，覆盖首次安装、重复安装、旧配置异常、端口、cloudflared 能力检查、下载失败、回滚、VMess 链接和本机 WebSocket 握手。测试只使用临时目录和回环地址，不安装软件、不访问真实 `/etc`，也不需要 Cloudflare 凭据。运行环境需要 Bash、curl、tar 和 Node.js（Node.js 仅用于测试，VPS 安装不需要）。
+仓库包含隔离的回归测试，覆盖首次安装、重复安装、旧配置异常、端口、cloudflared 能力检查与架构分发、下载失败、回滚、VMess 链接和本机 WebSocket 握手。测试只使用临时目录和回环地址，不安装软件、不访问真实 `/etc`，也不需要 Cloudflare 凭据。运行环境需要 Bash、curl、tar 和 Node.js（Node.js 仅用于测试，VPS 安装不需要）。
 
 管理器回归测试还覆盖本地 `fczd` 入口/模板安装、冲突拒绝、失败后清理与重试、旧配置识别、列表不泄露凭据、Token 复用、服务操作范围、菜单分派、更换首页、取消卸载、卸载保留共享/用户/审计文件，以及 Nginx 校验失败后的文件和服务恢复。
 

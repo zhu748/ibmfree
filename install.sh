@@ -375,6 +375,41 @@ install_cloudflared_s390x() {
   success "cloudflared s390x 发布包校验并安装完成。"
 }
 
+detect_cloudflared_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64)
+      printf '%s %s\n' "amd64" "fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2"
+      ;;
+    aarch64 | arm64)
+      printf '%s %s\n' "arm64" "7747d94570fb390cf47dcb4f9555c193c6355cda9793f0d878d9049e5d6a7790"
+      ;;
+    *)
+      die "当前架构没有官方 cloudflared 发布包，请通过 CLOUDFLARED_BIN 指定可执行文件。"
+      ;;
+  esac
+}
+
+install_cloudflared_official() {
+  local arch expected_hash actual_hash binary url
+
+  read -r arch expected_hash < <(detect_cloudflared_arch)
+  TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+  binary="${TEMP_DIR}/cloudflared-linux-${arch}"
+  url="https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}"
+
+  info "下载 cloudflared ${CLOUDFLARED_VERSION} 官方 ${arch} 发布包……"
+  download_file "$url" "$binary"
+  actual_hash=$(sha256_file "$binary")
+  [[ ${actual_hash,,} == "$expected_hash" ]] || \
+    die "cloudflared 发布包 SHA-256 校验失败。期望 ${expected_hash}，实际 ${actual_hash}。"
+
+  install -d -o root -g root -m 0755 "$(dirname "$CLOUDFLARED_INSTALL_PATH")"
+  backup_file "$CLOUDFLARED_INSTALL_PATH"
+  install_managed_file root root 0755 "$binary" "$CLOUDFLARED_INSTALL_PATH"
+  CLOUDFLARED_BIN=$CLOUDFLARED_INSTALL_PATH
+  success "cloudflared 官方发布包校验并安装完成。"
+}
+
 ensure_cloudflared() {
   local help_output=""
 
@@ -383,7 +418,13 @@ ensure_cloudflared() {
   fi
 
   if [[ -z "$CLOUDFLARED_BIN" ]]; then
-    install_cloudflared_s390x
+    case "$(uname -m)" in
+      s390x | s390) install_cloudflared_s390x ;;
+      x86_64 | amd64 | aarch64 | arm64) install_cloudflared_official ;;
+      *)
+        die "当前架构没有自动 cloudflared 安装包，请通过 CLOUDFLARED_BIN 指定可执行文件。"
+        ;;
+    esac
   fi
 
   [[ $CLOUDFLARED_BIN =~ ^/[A-Za-z0-9_./-]+$ ]] || die "cloudflared 路径包含不安全字符。"

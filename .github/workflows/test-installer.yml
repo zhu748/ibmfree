@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - name: Check syntax
         run: |
-          for script in install.sh bootstrap.sh scripts/*.sh tests/*.sh; do
+          for script in install.sh bootstrap.sh bootstrap-vps.sh scripts/*.sh tests/*.sh; do
             bash -n "$script"
           done
       - name: Run isolated regression tests

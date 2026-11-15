@@ -323,6 +323,62 @@ test_broken_cloudflared() {
   fi
 }
 
+test_cloudflared_arch_dispatch() {
+  local mock="${TEST_ROOT}/cloudflared"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    '[[ $* == "tunnel --no-autoupdate --metrics 127.0.0.1:0 run --help" ]] || exit 2' \
+    "printf '%s\n' '--token-file'" >"$mock"
+  chmod 0755 "$mock"
+  command() { if [[ $1 == -v && $2 == cloudflared ]]; then return 1; fi; builtin command "$@"; }
+  install_cloudflared_s390x() { CLOUDFLARED_BIN="$mock"; printf 's390x\n' >>"${TEST_ROOT}/dispatch"; }
+  install_cloudflared_official() { CLOUDFLARED_BIN="$mock"; printf 'official\n' >>"${TEST_ROOT}/dispatch"; }
+  uname() { printf x86_64; }
+  CLOUDFLARED_BIN=""
+  ensure_cloudflared
+  uname() { printf aarch64; }
+  CLOUDFLARED_BIN=""
+  ensure_cloudflared
+  uname() { printf s390x; }
+  CLOUDFLARED_BIN=""
+  ensure_cloudflared
+  assert_equal "$(<"${TEST_ROOT}/dispatch")" $'official\nofficial\ns390x'
+  uname() { printf riscv64; }
+  CLOUDFLARED_BIN=""
+  if (ensure_cloudflared) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'unknown architecture accepted'
+  fi
+  grep -q 'CLOUDFLARED_BIN' "${TEST_ROOT}/error"
+}
+
+test_cloudflared_official_install() {
+  local case_arch asset expected_hash captured_url
+  for case_arch in x86_64 aarch64; do
+    uname() { printf "$case_arch"; }
+    read -r asset expected_hash _ < <(detect_cloudflared_arch)
+    captured_url=""
+    download_file() { captured_url=$1; printf binary >"$2"; }
+    sha256_file() { printf '%s' "$expected_hash"; }
+    mock_file_install
+    install_cloudflared_official
+    [[ $captured_url == "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${asset}" ]] ||
+      fail 'unexpected official cloudflared download URL'
+    [[ -x $CLOUDFLARED_INSTALL_PATH ]] || fail 'official cloudflared not installed'
+    assert_equal "$CLOUDFLARED_BIN" "$CLOUDFLARED_INSTALL_PATH"
+    CLOUDFLARED_BIN=""
+  done
+  assert_no_file_stages
+}
+
+test_cloudflared_checksum_failure() {
+  uname() { printf x86_64; }
+  download_file() { printf corrupt >"$2"; }
+  if (install_cloudflared_official) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'bad official cloudflared checksum accepted'
+  fi
+  grep -q SHA-256 "${TEST_ROOT}/error"
+  [[ ! -e $CLOUDFLARED_INSTALL_PATH ]] || fail 'unverified binary installed'
+}
+
 test_tunnel_metrics_private() {
   CLOUDFLARED_BIN=/usr/local/bin/cloudflared
   render_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl" "${TEST_ROOT}/tunnel.service"
@@ -518,7 +574,10 @@ mock_file_install() {
     if [[ $# -ge 8 && $1 == -d && $2 == -o && $4 == -g && $6 == -m ]]; then
       local mode=$7 directory
       shift 7
-      for directory in "$@"; do [[ $directory == "${TEST_ROOT}/"* ]] || fail 'unexpected directory installation'; done
+      for directory in "$@"; do
+        [[ $directory == "${TEST_ROOT}" || $directory == "${TEST_ROOT}/"* ]] ||
+          fail 'unexpected directory installation'
+      done
       command mkdir -p -m "$mode" -- "$@"
       return
     fi
@@ -1389,6 +1448,12 @@ load_bootstrap() {
   TEMP_DIR="${TEST_ROOT}/work"
 }
 
+load_vps_bootstrap() {
+  source "${REPO_ROOT}/bootstrap-vps.sh"
+  trap - EXIT
+  TEMP_DIR="${TEST_ROOT}/work"
+}
+
 test_bootstrap_download_failure() {
   load_bootstrap
   curl() { return 22; }
@@ -1426,6 +1491,27 @@ test_bootstrap_bad_archive() {
   [[ ! -e ${TEMP_DIR}/source/install.sh ]] || fail 'bad archive left installer'
 }
 
+test_vps_bootstrap_arch_gate() {
+  load_vps_bootstrap
+  uname() { printf x86_64; }
+  check_supported_arch
+  uname() { printf amd64; }
+  check_supported_arch
+  uname() { printf aarch64; }
+  check_supported_arch
+  uname() { printf arm64; }
+  check_supported_arch
+  uname() { printf s390x; }
+  if (check_supported_arch) >"${TEST_ROOT}/error" 2>&1; then
+    fail 's390x accepted by the mainstream entry'
+  fi
+  grep -q 'bootstrap.sh' "${TEST_ROOT}/error"
+  uname() { printf riscv64; }
+  if (check_supported_arch) >"${TEST_ROOT}/error" 2>&1; then
+    fail 'unknown architecture accepted'
+  fi
+}
+
 if [[ ${1-} == --case ]]; then
   readonly TEST_ROOT=$3
   load_installer "$@"
@@ -1452,7 +1538,9 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_port_preflight_free test_port_preflight_owned test_port_preflight_conflicts \
   test_port_preflight_errors test_port_preflight_modes \
   test_choose_port_free test_choose_port_failure test_choose_port_exhausted \
-  test_large_cloudflared_help test_broken_cloudflared test_tunnel_metrics_private test_tunnel_core_independent \
+  test_large_cloudflared_help test_broken_cloudflared test_cloudflared_arch_dispatch \
+  test_cloudflared_official_install test_cloudflared_checksum_failure \
+  test_tunnel_metrics_private test_tunnel_core_independent \
   test_listener_audit_loopback test_listener_audit_exposure test_listener_audit_direct \
   test_listener_audit_unrelated test_listener_audit_unavailable test_websocket_upgrade \
   test_http_only_fails test_forged_accept_fails test_curl_failure_fails \
@@ -1472,7 +1560,7 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_manager_cli_arguments test_status_omits_journal test_file_rollback_no_service_change test_nginx_restore_and_failure \
   test_service_rollback_reports_failure test_uninstall_snapshot_failure test_management_service_failure_restore test_uninstall_ownership_recheck \
   test_real_http test_real_socket_preflight \
-  test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do
+  test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive test_vps_bootstrap_arch_gate; do
   ((count += 1))
   mkdir "${TEST_ROOT}/${test}"
   if bash "$SELF" --case "$test" "${TEST_ROOT}/${test}" >"${TEST_ROOT}/${test}.log" 2>&1; then

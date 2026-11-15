@@ -48,20 +48,7 @@ server {
     index index.html;
     autoindex off;
 
-    location = {{WS_PATH}} {
-        if ($edge_websocket_request = 0) { return 404; }
-
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $edge_connection_upgrade;
-        proxy_set_header Host $host;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_pass http://127.0.0.1:{{SING_BOX_PORT}};
-        proxy_intercept_errors on;
-        error_page 301 302 303 307 308 400 403 404 405 426 500 502 503 504 =404 @edge_not_found;
-        access_log off;
-    }
+{{PROXY_LOCATION}}
 
     location / {
         try_files $uri $uri/ =404;
@@ -73,7 +60,7 @@ server {
         log_not_found off;
     }
 
-    location ~* (\.bak($|[./])|\.restore\.|\.(old|orig|save|swp|tmp)$|~$|/(config\.json|client\.txt|tunnel\.token)$) {
+    location ~* (\.bak($|[./])|\.restore\.|\.(old|orig|save|swp|tmp)$|~$|/(config\.json|client\.txt|tunnel\.token|vless-keys\.json|install-state\.json)$) {
         return 404;
     }
 

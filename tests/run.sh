@@ -17,6 +17,8 @@ load_installer() {
     -e 's|^readonly NGINX_CONFIG=.*|readonly NGINX_CONFIG="${TEST_ROOT}/nginx.conf"|' \
     -e 's|^readonly SYSTEMD_DIR=.*|readonly SYSTEMD_DIR="${TEST_ROOT}/units"|' \
     -e 's|^readonly SING_BOX_BIN=.*|readonly SING_BOX_BIN="${TEST_ROOT}/edge-router"|' \
+    -e 's|^readonly MANAGER_DIR=.*|readonly MANAGER_DIR="${TEST_ROOT}/manager"|' \
+    -e 's|^readonly COMMAND_PATH=.*|readonly COMMAND_PATH="${TEST_ROOT}/bin/fczd"|' \
     -e 's|^readonly CLOUDFLARED_INSTALL_PATH=.*|readonly CLOUDFLARED_INSTALL_PATH="${TEST_ROOT}/cloudflared"|' \
     -e 's|^readonly TEMPLATE_DIR=.*|readonly TEMPLATE_DIR="${REPO_ROOT}/templates"|' \
     "${REPO_ROOT}/install.sh" >"${TEST_ROOT}/install.sh"
@@ -27,6 +29,7 @@ load_installer() {
   TEMP_DIR="${TEST_ROOT}/work"
   PUBLIC_DOMAIN=edge.example.com
   DEPLOY_MODE=tunnel
+  PROXY_MODE=vmess-ws
   CUSTOM_UUID=""
   WS_PATH=""
   ORIGIN_PORT=8001
@@ -172,6 +175,9 @@ test_install_lock_real() {
     return 77
   fi
   acquire_install_lock
+  local first_fd=$INSTALL_LOCK_FD
+  acquire_install_lock
+  assert_equal "$INSTALL_LOCK_FD" "$first_fd"
   if (
     exec {INSTALL_LOCK_FD}>&-
     acquire_install_lock
@@ -509,6 +515,13 @@ assert_no_file_stages() {
 
 mock_file_install() {
   install() {
+    if [[ $# -ge 8 && $1 == -d && $2 == -o && $4 == -g && $6 == -m ]]; then
+      local mode=$7 directory
+      shift 7
+      for directory in "$@"; do [[ $directory == "${TEST_ROOT}/"* ]] || fail 'unexpected directory installation'; done
+      command mkdir -p -m "$mode" -- "$@"
+      return
+    fi
     [[ $# == 8 && $1 == -o && $3 == -g && $5 == -m &&
       $8 == "${TEST_ROOT}/"* && $8 == */.edge-stage.*/payload ]] || fail 'unexpected file installation'
     if [[ $(uname -s) == Linux ]]; then
@@ -774,6 +787,557 @@ test_vmess_fixture() {
   node -e 'const fs=require("fs"),path=require("path"),assert=require("assert/strict"); const root=process.argv[1]; const c=JSON.parse(fs.readFileSync(path.join(root,"config/config.json"),"utf8")); const uri=fs.readFileSync(path.join(root,"config/client.txt"),"utf8").trim(); assert.ok(uri.startsWith("vmess://")); const v=JSON.parse(Buffer.from(uri.slice(8),"base64").toString("utf8")); assert.equal(v.id,c.inbounds[0].users[0].uuid); assert.equal(v.path,c.inbounds[0].transport.path); assert.equal(c.inbounds[0].listen_port,23456); assert.equal(v.net,"ws"); assert.equal(v.tls,"tls"); for (const mode of ["tunnel","direct"]) { const n=fs.readFileSync(path.join(root,mode+".tpl.conf"),"utf8"); assert.ok(n.includes(v.path)); assert.ok(n.includes("127.0.0.1:23456")); assert.ok(!n.includes("{{")); }' "${TEST_ROOT}/fixture"
 }
 
+test_profile_selection() {
+  local choice expected
+  for choice in 1 2 3; do
+    PROXY_MODE=""
+    collect_configuration <<<"$choice"
+    case $choice in
+      1) expected=vmess-ws ;; 2) expected=vless-xhttp ;; 3) expected=vless-xhttp-encryption ;;
+    esac
+    assert_equal "$PROXY_MODE" "$expected"
+  done
+  PROXY_MODE=invalid
+  if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'invalid profile accepted'; fi
+}
+
+set_fixture_keys() {
+  VLESS_DECRYPTION="mlkem768x25519plus.native.600s.$(printf 'a%.0s' {1..43})"
+  VLESS_ENCRYPTION="mlkem768x25519plus.native.0rtt.$(printf 'b%.0s' {1..43})"
+}
+
+test_vless_reinstall_and_switch() {
+  PROXY_MODE=vless-xhttp-encryption
+  collect_configuration </dev/null
+  set_fixture_keys
+  render_core_configuration "$CONFIG_PATH"
+  printf '{"decryption":"%s","encryption":"%s"}\n' "$VLESS_DECRYPTION" "$VLESS_ENCRYPTION" >"$ENCRYPTION_PATH"
+  local old_uuid=$CUSTOM_UUID old_path=$WS_PATH old_port=$SING_BOX_PORT old_key=$VLESS_DECRYPTION
+  PROXY_MODE="" CUSTOM_UUID="" WS_PATH="" SING_BOX_PORT=""
+  collect_configuration </dev/null
+  assert_equal "$PROXY_MODE" vless-xhttp-encryption
+  assert_equal "$CUSTOM_UUID" "$old_uuid"
+  assert_equal "$WS_PATH" "$old_path"
+  assert_equal "$SING_BOX_PORT" "$old_port"
+  assert_equal "$VLESS_DECRYPTION" "$old_key"
+  PROXY_MODE=vmess-ws
+  collect_configuration </dev/null
+  render_core_configuration "$CONFIG_PATH"
+  PROXY_MODE=vless-xhttp-encryption
+  collect_configuration </dev/null
+  assert_equal "$VLESS_DECRYPTION" "$old_key"
+}
+
+test_vless_missing_or_mismatched_keys() {
+  PROXY_MODE=vless-xhttp-encryption
+  collect_configuration </dev/null
+  set_fixture_keys
+  render_core_configuration "$CONFIG_PATH"
+  if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'missing existing keys silently rotated'; fi
+  printf '{}' >"$ENCRYPTION_PATH"
+  if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'invalid key file accepted'; fi
+  printf '{"decryption":"mlkem768x25519plus.native.600s.%s","encryption":"%s"}\n' \
+    "$(printf 'c%.0s' {1..43})" "$VLESS_ENCRYPTION" >"$ENCRYPTION_PATH"
+  if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'mismatched keys accepted'; fi
+}
+
+test_xray_checksum_failure() {
+  download_file() { printf corrupt >"$2"; }
+  if (install_xray) >"${TEST_ROOT}/error" 2>&1; then fail 'bad Xray checksum accepted'; fi
+  grep -q SHA-256 "${TEST_ROOT}/error"
+  [[ ! -e $SING_BOX_BIN ]] || fail 'unverified binary installed'
+}
+
+test_vless_output_contract() {
+  local profile
+  for profile in vless-xhttp vless-xhttp-encryption; do
+    PROXY_MODE=$profile
+    collect_configuration </dev/null
+    if [[ $profile == vless-xhttp-encryption ]]; then set_fixture_keys; fi
+    render_core_configuration "${TEST_ROOT}/rendered.json"
+    render_file "${TEMPLATE_DIR}/edge-router.service.tpl" "${TEST_ROOT}/edge.service"
+    grep -Fq "run -config ${CONFIG_PATH}" "${TEST_ROOT}/edge.service"
+    render_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl" "${TEST_ROOT}/rendered.conf"
+    grep -Fq "location ^~ ${WS_PATH}/" "${TEST_ROOT}/rendered.conf"
+    grep -q 'proxy_request_buffering off' "${TEST_ROOT}/rendered.conf"
+    mock_file_install
+    write_client_link
+    node - "$CLIENT_PATH" "${TEST_ROOT}/rendered.json" "$profile" <<'NODE'
+const fs = require('node:fs'), assert = require('node:assert/strict');
+const [linkFile, configFile, profile] = process.argv.slice(2);
+const uri = fs.readFileSync(linkFile, 'utf8').trim(), link = new URL(uri);
+const config = JSON.parse(fs.readFileSync(configFile, 'utf8')), inbound = config.inbounds[0];
+assert.equal(link.protocol, 'vless:'); assert.equal(link.port, '443');
+assert.equal(link.hostname, 'edge.example.com'); assert.equal(link.username, inbound.settings.clients[0].id);
+assert.equal(link.searchParams.get('path'), inbound.streamSettings.xhttpSettings.path);
+assert.equal(link.searchParams.get('type'), 'xhttp'); assert.equal(link.searchParams.get('mode'), 'packet-up');
+assert.equal(link.searchParams.get('security'), 'tls'); assert.equal(inbound.listen, '127.0.0.1');
+assert.equal(inbound.protocol, 'vless'); assert.equal(inbound.streamSettings.security, 'none');
+assert.equal(link.searchParams.has('flow'), false);
+const encrypted = profile.endsWith('-encryption');
+assert.equal(inbound.settings.decryption !== 'none', encrypted);
+assert.equal(link.searchParams.get('encryption') !== 'none', encrypted);
+assert.ok(!uri.includes('test-only-token'));
+if (encrypted) assert.ok(!uri.includes(inbound.settings.decryption.split('.').at(-1)), 'private key leaked');
+NODE
+  done
+}
+
+test_xhttp_health_requires_core() {
+  PROXY_MODE=vless-xhttp
+  collect_configuration </dev/null
+  local_http_request() { [[ $1 == / ]] && printf 200 || printf 404; }
+  if (check_local_site) >"${TEST_ROOT}/error" 2>&1; then fail 'static site alone passed XHTTP health'; fi
+  local_http_request() {
+    if [[ $1 != / ]]; then
+      [[ $1 == "$WS_PATH/"*/0 && $* == *'--request POST --data-binary'* ]] || fail 'not a packet-up probe'
+    fi
+    printf 200
+  }
+  check_local_site
+}
+
+test_management_bundle() {
+  collect_configuration </dev/null
+  mock_file_install
+  install_management
+  [[ -s ${MANAGER_DIR}/install.sh && -s ${MANAGER_DIR}/templates/xray.json.tpl && -x $COMMAND_PATH ]]
+  ! grep -q '{{' "$COMMAND_PATH" || fail 'unrendered manager entry'
+  env TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" "$COMMAND_PATH" help >"${TEST_ROOT}/help"
+  grep -q 'uninstall' "${TEST_ROOT}/help"
+  check_manager_destination
+}
+
+test_management_conflicts() {
+  mkdir -p "${COMMAND_PATH%/*}"
+  printf 'other-program\n' >"$COMMAND_PATH"
+  if (check_manager_destination) >"${TEST_ROOT}/error" 2>&1; then fail 'unrelated fczd command overwritten'; fi
+  assert_equal "$(<"$COMMAND_PATH")" other-program
+  rm "$COMMAND_PATH"
+  mkdir "$MANAGER_DIR"
+  if (check_manager_destination) >"${TEST_ROOT}/error" 2>&1; then fail 'unrelated manager directory accepted'; fi
+}
+
+test_management_bundle_rollback() {
+  cat >"${TEST_ROOT}/management-worker.sh" <<'WORKER'
+source "${TEST_ROOT}/install.sh"
+TEMP_DIR="${TEST_ROOT}/work"
+install() {
+  if [[ $1 == -d ]]; then
+    shift 7
+    command mkdir -p -- "$@"
+  else
+    command install -m "$6" -- "$7" "$8"
+  fi
+}
+restore_service_state() { :; }
+install_management
+exit 42
+WORKER
+  local status=0
+  env TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" bash "${TEST_ROOT}/management-worker.sh" >"${TEST_ROOT}/worker.log" 2>&1 || status=$?
+  assert_equal "$status" 42
+  [[ ! -e $COMMAND_PATH && ! -e $MANAGER_DIR ]] || fail 'failed install left an unusable manager directory'
+  check_manager_destination
+}
+
+prepare_management_fixture() {
+  PROXY_MODE=vless-xhttp-encryption
+  collect_configuration </dev/null
+  set_fixture_keys
+  render_core_configuration "$CONFIG_PATH"
+  render_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl" "$NGINX_CONFIG"
+  printf '{"deploy_mode":"tunnel","public_domain":"edge.example.com","origin_port":8001}\n' >"$STATE_PATH"
+  printf '#!/usr/bin/env bash\nprintf "Xray fixture version\\n"\n' >"$SING_BOX_BIN"
+  chmod 0755 "$SING_BOX_BIN"
+  printf 'secret-client-link' >"$CLIENT_PATH"
+  printf 'secret-token' >"$TOKEN_PATH"
+}
+
+test_management_list_private() {
+  prepare_management_fixture
+  systemctl() { printf inactive; return 3; }
+  list_installed >"${TEST_ROOT}/listing"
+  grep -Eq '^  vless-xhttp-encryption[[:space:]]+已安装$' "${TEST_ROOT}/listing"
+  assert_equal "$(grep -c '已安装$' "${TEST_ROOT}/listing")" 1
+  ! grep -Fq "$CUSTOM_UUID" "${TEST_ROOT}/listing" || fail 'UUID in list'
+  ! grep -Fq "$WS_PATH" "${TEST_ROOT}/listing" || fail 'secret path in list'
+  ! grep -Eq 'secret-client|secret-token|mlkem768' "${TEST_ROOT}/listing" || fail 'credentials in list'
+}
+
+test_management_legacy_configuration() {
+  local profile
+  for profile in vmess-ws vless-xhttp vless-xhttp-encryption; do
+    PROXY_MODE=$profile
+    collect_configuration </dev/null
+    if [[ $profile == vless-xhttp-encryption ]]; then set_fixture_keys; fi
+    render_core_configuration "$CONFIG_PATH"
+    render_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl" "$NGINX_CONFIG"
+    PUBLIC_DOMAIN="" WS_PATH="" SING_BOX_PORT=""
+    load_management_configuration
+    assert_equal "$PROXY_MODE" "$profile"
+    assert_equal "$PUBLIC_DOMAIN" edge.example.com
+    assert_equal "$ORIGIN_PORT" 8001
+  done
+}
+
+test_management_install_reuses_token() {
+  prepare_management_fixture
+  TUNNEL_TOKEN_FILE=""
+  preflight_environment() { :; }
+  acquire_install_lock() { :; }
+  main() {
+    assert_equal "$PROXY_MODE" 2
+    assert_equal "$PUBLIC_DOMAIN" edge.example.com
+    assert_equal "$TUNNEL_TOKEN_FILE" "$TOKEN_PATH"
+    assert_equal "$WS_PATH" "$(read_json_string "$CONFIG_PATH" path)"
+  }
+  manage_install 2
+}
+
+test_management_service_scope() {
+  prepare_management_fixture
+  preflight_environment() { :; }
+  acquire_install_lock() { :; }
+  check_local_site() { :; }
+  check_core_configuration() { :; }
+  nginx() { :; }
+  systemctl() {
+    printf '%s\n' "$*" >>"${TEST_ROOT}/service-calls"
+    if [[ $1 == is-active && $* != 'is-active --quiet nginx' ]]; then return 3; fi
+  }
+  manage_services restart
+  grep -qx 'restart edge-router' "${TEST_ROOT}/service-calls"
+  grep -qx 'restart edge-tunnel' "${TEST_ROOT}/service-calls"
+  grep -qx 'reload nginx' "${TEST_ROOT}/service-calls"
+  : >"${TEST_ROOT}/service-calls"
+  manage_services stop
+  grep -qx 'stop edge-router' "${TEST_ROOT}/service-calls"
+  grep -qx 'stop edge-tunnel' "${TEST_ROOT}/service-calls"
+  ! grep -Eq 'stop nginx|disable' "${TEST_ROOT}/service-calls" || fail 'shared nginx/boot settings changed by stop'
+}
+
+test_management_menu_dispatch() {
+  bash() {
+    assert_equal "$1" "${SCRIPT_DIR}/install.sh"
+    assert_equal "$2" --manage
+    assert_equal "$3" list
+    printf called >"${TEST_ROOT}/menu-called"
+    return 1
+  }
+  manager_menu <<<'2
+0'
+  [[ -f ${TEST_ROOT}/menu-called ]] || fail 'menu did not dispatch'
+  manager_menu </dev/null
+}
+
+test_management_site() {
+  prepare_management_fixture
+  mkdir -p "$SITE_ROOT"
+  printf original >"${SITE_ROOT}/index.html"
+  printf '<h1>My real site</h1>' >"${TEST_ROOT}/custom.html"
+  preflight_environment() { :; }
+  acquire_install_lock() { :; }
+  capture_service_state() { :; }
+  mock_file_install
+  manage_site "${TEST_ROOT}/custom.html"
+  assert_equal "$(<"${SITE_ROOT}/index.html")" '<h1>My real site</h1>'
+  [[ $ROLLBACK_ACTIVE == false ]] || fail 'site update did not commit'
+  [[ -f $CONFIG_PATH && -s $TOKEN_PATH ]] || fail 'site update changed proxy configuration'
+}
+
+test_uninstall_cancel() {
+  prepare_management_fixture
+  uninstall_deployment <<<''
+  [[ -f $CONFIG_PATH && -f $SING_BOX_BIN && -f $TOKEN_PATH ]] || fail 'cancel removed files'
+}
+
+prepare_uninstall_fixture() {
+  prepare_management_fixture
+  mock_file_install
+  install_management
+  mkdir -p "$SYSTEMD_DIR" "$SITE_ROOT" "${CONFIG_DIR}/tls"
+  printf 'unit core' >"${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+  printf 'unit tunnel' >"${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
+  printf 'keep custom website' >"${SITE_ROOT}/index.html"
+  printf 'keep user file' >"${CONFIG_DIR}/custom.txt"
+  printf 'keep shared connector' >"$CLOUDFLARED_INSTALL_PATH"
+  printf 'keep other nginx site' >"${TEST_ROOT}/other.conf"
+  printf 'keep audit' >"${TEST_ROOT}/system.log"
+  ROLLBACK_TARGETS=() ROLLBACK_BACKUPS=() BACKUP_DIR="" ROLLBACK_ACTIVE=false
+}
+
+test_uninstall_scope() {
+  prepare_uninstall_fixture
+  preflight_environment() { :; }
+  acquire_install_lock() { :; }
+  capture_service_state() { NGINX_WAS_ACTIVE=true; }
+  systemctl() {
+    printf '%s\n' "$*" >>"${TEST_ROOT}/service-calls"
+    [[ $1 != is-active ]]
+  }
+  nginx() { assert_equal "$*" -t; [[ ! -e $NGINX_CONFIG ]]; }
+  uninstall_deployment --yes
+  [[ ! -e $CONFIG_PATH && ! -e $TOKEN_PATH && ! -e $COMMAND_PATH && ! -e $MANAGER_DIR ]] || fail 'managed files remain'
+  [[ -s ${CONFIG_DIR}/custom.txt && -s ${SITE_ROOT}/index.html && -s $CLOUDFLARED_INSTALL_PATH &&
+     -s ${TEST_ROOT}/other.conf && -s ${TEST_ROOT}/system.log ]] || fail 'shared/user/audit files removed'
+  [[ -s ${BACKUP_DIR}/paths.tsv ]] || fail 'uninstall lost recovery backups'
+  ! grep -Eq 'disable --now nginx|stop nginx' "${TEST_ROOT}/service-calls" || fail 'shared nginx stopped'
+}
+
+test_uninstall_rollback() {
+  prepare_uninstall_fixture
+  cp "$NGINX_CONFIG" "${TEST_ROOT}/nginx.before"
+  cat >"${TEST_ROOT}/uninstall-worker.sh" <<'WORKER'
+source "${TEST_ROOT}/install.sh"
+preflight_environment() { :; }
+acquire_install_lock() { :; }
+systemctl() { [[ $1 != is-active && $1 != is-enabled ]]; }
+nginx() { return 1; }
+restore_service_state() { printf '%s\n' "$*" >>"${TEST_ROOT}/restore-calls"; }
+uninstall_deployment --yes
+WORKER
+  if env TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" bash "${TEST_ROOT}/uninstall-worker.sh" >"${TEST_ROOT}/worker.log" 2>&1; then
+    fail 'failed nginx validation committed uninstall'
+  fi
+  cmp "$NGINX_CONFIG" "${TEST_ROOT}/nginx.before"
+  [[ -s $CONFIG_PATH && -s $TOKEN_PATH && -x $SING_BOX_BIN && -x $COMMAND_PATH ]] || fail 'failed uninstall lost files'
+  grep -q edge-router "${TEST_ROOT}/restore-calls"
+  grep -q nginx "${TEST_ROOT}/restore-calls"
+}
+
+test_repeat_ingress_settings() {
+  write_existing_config
+  printf '{"deploy_mode":"tunnel","origin_port":9123}\n' >"$STATE_PATH"
+  collect_configuration </dev/null
+  assert_equal "$ORIGIN_PORT" 9123
+  rm "$STATE_PATH"
+  render_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl" "$NGINX_CONFIG"
+  ORIGIN_PORT=8001
+  REQUESTED_DEPLOY_MODE=TUNNEL DEPLOY_MODE=TUNNEL
+  collect_configuration </dev/null
+  assert_equal "$ORIGIN_PORT" 9123
+  REQUESTED_DEPLOY_MODE=""
+  printf '{"deploy_mode":"direct","origin_port":9123}\n' >"$STATE_PATH"
+  printf cert >"${TEST_ROOT}/cert"
+  printf key >"${TEST_ROOT}/key"
+  TLS_CERT_FILE="${TEST_ROOT}/cert" TLS_KEY_FILE="${TEST_ROOT}/key"
+  DEPLOY_MODE=tunnel ORIGIN_PORT=8001
+  collect_configuration </dev/null
+  assert_equal "$DEPLOY_MODE" direct
+  assert_equal "$ORIGIN_PORT" 9123
+}
+
+test_management_install_overrides() {
+  prepare_management_fixture
+  WS_PATH=/new-path/0123456789abcdef
+  SING_BOX_PORT=25001
+  REQUESTED_DEPLOY_MODE=DIRECT REQUESTED_ORIGIN_PORT=9090
+  printf cert >"${TEST_ROOT}/cert"
+  printf key >"${TEST_ROOT}/key"
+  TLS_CERT_FILE="${TEST_ROOT}/cert" TLS_KEY_FILE="${TEST_ROOT}/key"
+  preflight_environment() { :; }
+  acquire_install_lock() { printf locked >"${TEST_ROOT}/locked"; }
+  installed_proxy_mode() { [[ -f ${TEST_ROOT}/locked ]] || fail 'read before lock'; printf vless-xhttp-encryption; }
+  main() {
+    collect_configuration </dev/null
+    assert_equal "$PROXY_MODE" vless-xhttp
+    assert_equal "$WS_PATH" /new-path/0123456789abcdef
+    assert_equal "$SING_BOX_PORT" 25001
+    assert_equal "$ORIGIN_PORT" 9090
+    assert_equal "$DEPLOY_MODE" direct
+    assert_equal "$TLS_CERT_FILE" "${TEST_ROOT}/cert"
+  }
+  manage_install 2
+}
+
+test_management_direct_cert_reuse() {
+  prepare_management_fixture
+  printf '{"deploy_mode":"direct","origin_port":8001}\n' >"$STATE_PATH"
+  mkdir -p "${CONFIG_DIR}/tls"
+  printf cert >"$TLS_CERT_PATH"
+  printf key >"$TLS_KEY_PATH"
+  preflight_environment() { :; }
+  acquire_install_lock() { :; }
+  main() {
+    assert_equal "$DEPLOY_MODE" direct
+    assert_equal "$TLS_CERT_FILE" "$TLS_CERT_PATH"
+    assert_equal "$TLS_KEY_FILE" "$TLS_KEY_PATH"
+  }
+  manage_install 2
+  rm "$TLS_CERT_PATH" "$TLS_KEY_PATH"
+  TLS_CERT_FILE="" TLS_KEY_FILE=""
+  main() {
+    [[ -z $TLS_CERT_FILE && -z $TLS_KEY_FILE ]] || fail 'missing certificates blocked interactive replacement'
+  }
+  manage_install 2
+}
+
+test_management_stop_broken() {
+  prepare_management_fixture
+  rm "$SING_BOX_BIN"
+  printf broken >"$CONFIG_PATH"
+  load_management_configuration() { fail 'stop parsed broken configuration'; }
+  preflight_environment() { :; }
+  acquire_install_lock() { :; }
+  local core_stopped=false tunnel_stopped=false
+  systemctl() {
+    printf '%s\n' "$*" >>"${TEST_ROOT}/calls"
+    case "$*" in
+      'is-active --quiet edge-router') [[ $core_stopped == false ]] ;;
+      'is-active --quiet edge-tunnel') [[ $tunnel_stopped == false ]] ;;
+      'stop edge-router') core_stopped=true ;;
+      'stop edge-tunnel') tunnel_stopped=true ;;
+    esac
+  }
+  manage_services stop
+  [[ $core_stopped == true && $tunnel_stopped == true ]] || fail 'broken install not stopped'
+  assert_equal "$(<"$CONFIG_PATH")" broken
+  ! grep -Eq 'stop nginx|disable|restart' "${TEST_ROOT}/calls" || fail 'stop affected other state'
+}
+
+test_management_restart_preflight() {
+  prepare_management_fixture
+  cat >"${TEST_ROOT}/preflight-worker.sh" <<'WORKER'
+source "${TEST_ROOT}/install.sh"
+preflight_environment() { :; }
+acquire_install_lock() { :; }
+check_core_configuration() { [[ $FAIL_STAGE != core ]]; }
+nginx() { [[ $FAIL_STAGE != nginx ]]; }
+systemctl() { printf '%s\n' "$*" >>"${TEST_ROOT}/mutations"; }
+manage_services restart
+WORKER
+  local stage
+  for stage in core nginx; do
+    if env FAIL_STAGE="$stage" TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" bash "${TEST_ROOT}/preflight-worker.sh" >"${TEST_ROOT}/worker.log" 2>&1; then
+      fail 'invalid configuration restarted services'
+    fi
+    [[ ! -e ${TEST_ROOT}/mutations ]] || fail 'preflight failure touched services'
+  done
+}
+
+test_manager_cli_arguments() {
+  validate_manager_arguments install 3
+  validate_manager_arguments site '/some path/index.html'
+  validate_manager_arguments uninstall --yes
+  local args
+  local -a parts
+  for args in 'install 2 extra' 'install invalid' 'uninstall --yes extra' 'uninstall --force' 'restart extra' 'help extra' 'status extra' 'unknown'; do
+    read -r -a parts <<<"$args"
+    if (validate_manager_arguments "${parts[@]}") >"${TEST_ROOT}/error" 2>&1; then fail 'unexpected arguments accepted'; fi
+  done
+}
+
+test_status_omits_journal() {
+  systemctl() {
+    assert_equal "$*" '--no-pager --full --lines=0 status edge-router edge-tunnel nginx'
+    return 3
+  }
+  show_service_status
+  systemctl() { return 1; }
+  if show_service_status; then fail 'systemd status error hidden'; fi
+}
+
+test_file_rollback_no_service_change() {
+  local original="${TEST_ROOT}/original"
+  printf before >"$original"
+  backup_file "$original"
+  printf after >"$original"
+  systemctl() { fail 'file-only rollback changed services'; }
+  restore_service_state() { fail 'file-only rollback restarted services'; }
+  rollback_installation
+  assert_equal "$(<"$original")" before
+}
+
+test_nginx_restore_and_failure() {
+  systemctl() {
+    printf '%s\n' "$*" >>"${TEST_ROOT}/calls"
+    [[ $1 != restart ]] || fail 'running shared nginx restarted'
+  }
+  restore_service_state nginx true true
+  grep -qx 'reload nginx' "${TEST_ROOT}/calls"
+  systemctl() { [[ $1 != reload ]]; }
+  if restore_service_state nginx true true >"${TEST_ROOT}/error" 2>&1; then fail 'reload failure reported as restored'; fi
+  grep -q '无法完整恢复 nginx' "${TEST_ROOT}/error"
+  systemctl() {
+    printf '%s\n' "$*" >>"${TEST_ROOT}/missing-calls"
+    [[ $1 != cat ]]
+  }
+  restore_service_state edge-router false false
+  grep -qx 'stop edge-router' "${TEST_ROOT}/missing-calls"
+}
+
+test_service_rollback_reports_failure() {
+  local original="${TEST_ROOT}/original"
+  printf before >"$original"
+  backup_file "$original"
+  printf after >"$original"
+  SERVICE_STATE_DIRTY=true
+  systemctl() { :; }
+  restore_service_state() { return 1; }
+  if rollback_installation >"${TEST_ROOT}/error" 2>&1; then fail 'partial service rollback reported as complete'; fi
+  assert_equal "$(<"$original")" before
+  grep -q '部分文件或服务未能回滚' "${TEST_ROOT}/error"
+}
+
+test_uninstall_snapshot_failure() {
+  prepare_uninstall_fixture
+  rm "$CLIENT_PATH"
+  mkdir "$CLIENT_PATH"
+  printf keep >"${CLIENT_PATH}/user-file"
+  cat >"${TEST_ROOT}/snapshot-worker.sh" <<'WORKER'
+source "${TEST_ROOT}/install.sh"
+preflight_environment() { :; }
+acquire_install_lock() { :; }
+systemctl() {
+  case $1 in
+    is-active | is-enabled) return 3 ;;
+    *) printf '%s\n' "$*" >>"${TEST_ROOT}/mutations" ;;
+  esac
+}
+uninstall_deployment --yes
+WORKER
+  if env TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" bash "${TEST_ROOT}/snapshot-worker.sh" >"${TEST_ROOT}/worker.log" 2>&1; then fail 'invalid managed path accepted'; fi
+  [[ ! -e ${TEST_ROOT}/mutations ]] || fail 'backup failure changed service states'
+  [[ -s $CONFIG_PATH && -s $NGINX_CONFIG && -x $COMMAND_PATH && -s ${CLIENT_PATH}/user-file ]] || fail 'backup failure lost files'
+}
+
+test_management_service_failure_restore() {
+  prepare_management_fixture
+  cat >"${TEST_ROOT}/restart-worker.sh" <<'WORKER'
+source "${TEST_ROOT}/install.sh"
+preflight_environment() { :; }
+acquire_install_lock() { :; }
+check_core_configuration() { :; }
+nginx() { :; }
+systemctl() {
+  printf '%s\n' "$*" >>"${TEST_ROOT}/calls"
+  [[ $* != 'reload nginx' ]]
+}
+restore_service_state() { printf '%s\n' "$*" >>"${TEST_ROOT}/restored"; }
+manage_services restart
+WORKER
+  if env TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" bash "${TEST_ROOT}/restart-worker.sh" >"${TEST_ROOT}/worker.log" 2>&1; then fail 'failed restart committed'; fi
+  grep -qx 'restart edge-router' "${TEST_ROOT}/calls"
+  grep -qx 'edge-router true true' "${TEST_ROOT}/restored"
+  grep -qx 'nginx true true' "${TEST_ROOT}/restored"
+  [[ -s $CONFIG_PATH && -s $TOKEN_PATH ]] || fail 'service rollback changed credentials'
+}
+
+test_uninstall_ownership_recheck() {
+  prepare_uninstall_fixture
+  cat >"${TEST_ROOT}/ownership-worker.sh" <<'WORKER'
+source "${TEST_ROOT}/install.sh"
+preflight_environment() { :; }
+acquire_install_lock() { printf 'other-program\n' >"$COMMAND_PATH"; }
+capture_service_state() { printf called >"${TEST_ROOT}/mutations"; }
+uninstall_deployment --yes
+WORKER
+  if env TEST_ROOT="$TEST_ROOT" REPO_ROOT="$REPO_ROOT" bash "${TEST_ROOT}/ownership-worker.sh" >"${TEST_ROOT}/worker.log" 2>&1; then fail 'changed ownership ignored'; fi
+  [[ ! -e ${TEST_ROOT}/mutations && -s $CONFIG_PATH && -s $NGINX_CONFIG ]] || fail 'ownership conflict changed installation'
+  assert_equal "$(<"$COMMAND_PATH")" other-program
+}
+
 test_real_http() {
   local pid attempt
   node "${REPO_ROOT}/tests/http-server.cjs" "${TEST_ROOT}/port" >"${TEST_ROOT}/server.log" 2>&1 &
@@ -899,6 +1463,14 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_missing_backup test_atomic_restore_copy_failure test_atomic_restore_rename_failure \
   test_atomic_restore_signal test_rollback_restores_files \
   test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link test_vmess_fixture \
+  test_profile_selection test_vless_reinstall_and_switch test_vless_missing_or_mismatched_keys \
+  test_xray_checksum_failure test_vless_output_contract test_xhttp_health_requires_core \
+  test_management_bundle test_management_conflicts test_management_bundle_rollback test_management_list_private test_management_legacy_configuration \
+  test_management_install_reuses_token test_management_service_scope test_management_menu_dispatch test_management_site \
+  test_uninstall_cancel test_uninstall_scope test_uninstall_rollback \
+  test_repeat_ingress_settings test_management_install_overrides test_management_direct_cert_reuse test_management_stop_broken test_management_restart_preflight \
+  test_manager_cli_arguments test_status_omits_journal test_file_rollback_no_service_change test_nginx_restore_and_failure \
+  test_service_rollback_reports_failure test_uninstall_snapshot_failure test_management_service_failure_restore test_uninstall_ownership_recheck \
   test_real_http test_real_socket_preflight \
   test_bootstrap_download_failure test_bootstrap_archive test_bootstrap_bad_archive; do
   ((count += 1))

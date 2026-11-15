@@ -135,7 +135,7 @@ async function checkMode(mode, originPort) {
   const conf = path.join(root, `${mode}.conf`);
   fs.writeFileSync(conf, `worker_processes 1;\npid ${root}/${mode}.pid;\n` +
     `error_log stderr warn;\nevents { worker_connections 128; }\nhttp {\n` +
-    `client_body_temp_path ${root}/client;\nproxy_temp_path ${root}/proxy;\n${template}\n}\n`, 'utf8');
+    `client_body_temp_path ${root}/client;\nproxy_temp_path ${root}/proxy;\nfastcgi_temp_path ${root}/fastcgi;\nuwsgi_temp_path ${root}/uwsgi;\nscgi_temp_path ${root}/scgi;\n${template}\n}\n`, 'utf8');
   await run('nginx', ['-p', root + '/', '-c', conf, '-t']);
   const nginx = start('nginx', ['-p', root + '/', '-c', conf, '-g', 'daemon off; master_process off;'], `${mode} nginx`);
   await waitPort(nginx, originPort);

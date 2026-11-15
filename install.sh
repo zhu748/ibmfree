@@ -4,6 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SING_BOX_VERSION="1.13.19"
+readonly XRAY_VERSION="26.11.9"
 readonly CLOUDFLARED_VERSION="2026.8.2"
 readonly CLOUDFLARED_RELEASE_TAG="cloudflared-${CLOUDFLARED_VERSION}-s390x"
 readonly CLOUDFLARED_RELEASE_BASE="https://github.com/zhu748/ibmfree/releases/download/${CLOUDFLARED_RELEASE_TAG}"
@@ -13,6 +14,10 @@ readonly TUNNEL_SERVICE_NAME="edge-tunnel"
 readonly CONFIG_DIR="/etc/edge-router"
 readonly CONFIG_PATH="${CONFIG_DIR}/config.json"
 readonly CLIENT_PATH="${CONFIG_DIR}/client.txt"
+readonly ENCRYPTION_PATH="${CONFIG_DIR}/vless-keys.json"
+readonly STATE_PATH="${CONFIG_DIR}/install-state.json"
+readonly MANAGER_DIR="/usr/local/lib/fczd"
+readonly COMMAND_PATH="/usr/local/bin/fczd"
 readonly TOKEN_PATH="${CONFIG_DIR}/tunnel.token"
 readonly TLS_CERT_PATH="${CONFIG_DIR}/tls/origin.crt"
 readonly TLS_KEY_PATH="${CONFIG_DIR}/tls/origin.key"
@@ -24,6 +29,11 @@ readonly NGINX_CONFIG="/etc/nginx/conf.d/edge-router.conf"
 readonly SYSTEMD_DIR="/etc/systemd/system"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly TEMPLATE_DIR="${SCRIPT_DIR}/templates"
+readonly -a MANAGED_TEMPLATES=(
+  sing-box.json.tpl xray.json.tpl nginx-tunnel.conf.tpl nginx-direct.conf.tpl
+  nginx-ws-location.conf.tpl nginx-xhttp-location.conf.tpl edge-router.service.tpl
+  edge-tunnel.service.tpl index.html fczd-command.tpl
+)
 
 COLOR_RED='\033[0;31m'
 COLOR_GREEN='\033[0;32m'
@@ -32,7 +42,12 @@ COLOR_CYAN='\033[0;36m'
 COLOR_RESET='\033[0m'
 
 PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
+REQUESTED_DEPLOY_MODE="${DEPLOY_MODE:-}"
+REQUESTED_ORIGIN_PORT="${ORIGIN_PORT:-}"
 DEPLOY_MODE="${DEPLOY_MODE:-tunnel}"
+PROXY_MODE="${PROXY_MODE:-}"
+VLESS_DECRYPTION="none"
+VLESS_ENCRYPTION="none"
 CUSTOM_UUID="${UUID:-}"
 WS_PATH="${WS_PATH:-}"
 ORIGIN_PORT="${ORIGIN_PORT:-8001}"
@@ -45,6 +60,7 @@ SITE_INDEX_FILE="${SITE_INDEX_FILE:-}"
 TEMP_DIR=""
 BACKUP_DIR=""
 INSTALL_LOCK_FD=""
+MANAGER_CREATED=false
 
 SITE_NONCE=""
 SITE_HUE=""
@@ -65,6 +81,7 @@ NGINX_WAS_ACTIVE=false
 NGINX_WAS_ENABLED=false
 TUNNEL_WAS_ACTIVE=false
 TUNNEL_WAS_ENABLED=false
+SERVICE_STATE_DIRTY=false
 
 info() {
   printf '%b\n' "${COLOR_CYAN}$*${COLOR_RESET}"
@@ -93,7 +110,7 @@ cleanup() {
 
 on_error() {
   local exit_code=$?
-  printf '%b\n' "${COLOR_RED}安装在第 ${BASH_LINENO[0]} 行失败（退出码: ${exit_code}）。${COLOR_RESET}" >&2
+  printf '%b\n' "${COLOR_RED}操作在第 ${BASH_LINENO[0]} 行失败（退出码: ${exit_code}）。${COLOR_RESET}" >&2
   exit "$exit_code"
 }
 
@@ -104,6 +121,10 @@ on_exit() {
     # An uncommitted transaction must never be reported as a successful install.
     ((exit_code != 0)) || exit_code=1
     rollback_installation || true
+  fi
+  if ((exit_code != 0)) && [[ $MANAGER_CREATED == true ]]; then
+    # Only empty directories created by this failed install are removed.
+    rmdir -- "${MANAGER_DIR}/templates" "$MANAGER_DIR" 2>/dev/null || true
   fi
   cleanup
   exit "$exit_code"
@@ -130,6 +151,11 @@ acquire_install_lock() {
   command -v flock >/dev/null 2>&1 || die "缺少 flock，请先安装系统基础包 util-linux。"
   [[ ! -L $INSTALL_LOCK_PATH ]] || die "安装锁不能是符号链接: ${INSTALL_LOCK_PATH}"
   [[ ! -e $INSTALL_LOCK_PATH || -f $INSTALL_LOCK_PATH ]] || die "安装锁路径不是普通文件: ${INSTALL_LOCK_PATH}"
+  # Management can acquire the lock before loading defaults, then enter main().
+  # Reuse only a descriptor that is still open in this process.
+  if [[ $INSTALL_LOCK_FD =~ ^[0-9]+$ ]] && ( : >&"$INSTALL_LOCK_FD" ) 2>/dev/null; then
+    return 0
+  fi
   exec {INSTALL_LOCK_FD}>>"$INSTALL_LOCK_PATH"
   flock --nonblock "$INSTALL_LOCK_FD" || die "另一个安装进程正在运行，或无法取得安装锁；请等待它结束后重试。"
   # Keep the inode in place; the descriptor releases the lock after exit/rollback.
@@ -284,6 +310,18 @@ detect_arch() {
   esac
 }
 
+detect_xray_arch() {
+  case "$(uname -m)" in
+    x86_64 | amd64)
+      printf '%s %s\n' "64" "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82" ;;
+    aarch64 | arm64)
+      printf '%s %s\n' "arm64-v8a" "64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be" ;;
+    s390x | s390)
+      printf '%s %s\n' "s390x" "5657912fbd7429d8a0202dccd8815a297fe49d009216a5359af238ebb6f0db4c" ;;
+    *) die "不支持的系统架构: $(uname -m)" ;;
+  esac
+}
+
 sha256_file() {
   local file=$1
 
@@ -302,7 +340,8 @@ download_file() {
   local url=$1
   local output=$2
 
-  curl --fail --location --silent --show-error \
+  curl --disable --fail --location --silent --show-error \
+    --proto '=https' --proto-redir '=https' \
     --retry 3 --connect-timeout 15 --max-time 300 \
     --output "$output" "$url"
 }
@@ -360,20 +399,21 @@ install_packages() {
 
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates coreutils curl iproute2 nginx tar
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates coreutils curl iproute2 nginx tar unzip
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates coreutils curl iproute nginx tar
+    dnf install -y ca-certificates coreutils curl iproute nginx tar unzip
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates coreutils curl iproute nginx tar
+    yum install -y ca-certificates coreutils curl iproute nginx tar unzip
   elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install ca-certificates coreutils curl iproute2 nginx tar
+    zypper --non-interactive install ca-certificates coreutils curl iproute2 nginx tar unzip
   else
-    die "不支持的包管理器，请先安装 curl、tar、ca-certificates 和 nginx。"
+    die "不支持的包管理器，请先安装 curl、tar、unzip、ca-certificates 和 nginx。"
   fi
 
   command -v curl >/dev/null 2>&1 || die "curl 安装失败。"
   command -v nginx >/dev/null 2>&1 || die "nginx 安装失败。"
   command -v ss >/dev/null 2>&1 || die "缺少 ss 命令（通常由 iproute2 提供）。"
+  command -v unzip >/dev/null 2>&1 || die "缺少 unzip 命令。"
 }
 
 read_json_string() {
@@ -398,21 +438,65 @@ collect_configuration() {
   local existing_uuid=""
   local generated_uuid=""
   local tunnel_token=""
+  local existing_mode="vmess-ws" existing_decryption="none"
+  local existing_protocols=""
 
   if [[ -e $CONFIG_PATH || -L $CONFIG_PATH ]]; then
     [[ -r $CONFIG_PATH && -s $CONFIG_PATH ]] || die "现有配置为空或不可读，已停止以保留原连接参数: ${CONFIG_PATH}"
     existing_uuid=$(read_json_string "$CONFIG_PATH" uuid)
     existing_path=$(read_json_string "$CONFIG_PATH" path)
     existing_port=$(read_json_number "$CONFIG_PATH" listen_port)
+    existing_protocols=$(read_json_string "$CONFIG_PATH" protocol)
+    if [[ -z $existing_uuid && ${existing_protocols%%$'\n'*} == vless ]]; then
+      [[ $(read_json_string "$CONFIG_PATH" network) == xhttp ]] || die "现有 VLESS 配置不是本安装器支持的 XHTTP 配置。"
+      existing_uuid=$(read_json_string "$CONFIG_PATH" id)
+      existing_port=$(read_json_number "$CONFIG_PATH" port)
+      existing_decryption=$(read_json_string "$CONFIG_PATH" decryption)
+      [[ -n $existing_decryption && $existing_decryption != *$'\n'* ]] || die "无法读取现有 VLESS 加密设置。"
+      existing_mode=vless-xhttp
+      [[ $existing_decryption == none ]] || existing_mode=vless-xhttp-encryption
+    fi
 
     validate_uuid "$existing_uuid" && validate_ws_path "$existing_path" && validate_port "$existing_port" || \
-      die "无法唯一读取现有 UUID、WS 路径和端口，已停止；请检查 ${CONFIG_PATH}，不要直接删除旧配置。"
+      die "无法唯一读取现有 UUID、代理路径和端口，已停止；请检查 ${CONFIG_PATH}，不要直接删除旧配置。"
 
     if [[ -z "$WS_PATH" ]] && validate_ws_path "$existing_path"; then
       WS_PATH=$existing_path
     fi
     if [[ -z "$SING_BOX_PORT" ]] && validate_port "$existing_port"; then
       SING_BOX_PORT=$existing_port
+    fi
+    if [[ -z $REQUESTED_DEPLOY_MODE && ( -r $STATE_PATH || -r $NGINX_CONFIG ) ]]; then
+      DEPLOY_MODE=$(installed_deploy_mode) || die "无法读取已有部署模式，请显式设置 DEPLOY_MODE。"
+    fi
+    if [[ -z $REQUESTED_ORIGIN_PORT && $ORIGIN_PORT == 8001 && ( -r $STATE_PATH || -r $NGINX_CONFIG ) ]]; then
+      ORIGIN_PORT=$(installed_origin_port "$DEPLOY_MODE") || die "无法读取已有入口端口，请显式设置 ORIGIN_PORT。"
+    fi
+  fi
+
+  if [[ -z $PROXY_MODE ]]; then
+    info "代理方案：1) VMess + WS + TLS  2) VLESS + XHTTP + TLS  3) VLESS + XHTTP + TLS + Encryption"
+    read_value PROXY_MODE "选择方案（1/2/3）" "$existing_mode"
+  fi
+  case "${PROXY_MODE,,}" in
+    1 | vmess-ws) PROXY_MODE=vmess-ws ;;
+    2 | vless-xhttp) PROXY_MODE=vless-xhttp ;;
+    3 | vless-xhttp-encryption) PROXY_MODE=vless-xhttp-encryption ;;
+    *) die "PROXY_MODE 只能是 vmess-ws、vless-xhttp 或 vless-xhttp-encryption（也可填 1/2/3）。" ;;
+  esac
+  VLESS_DECRYPTION=none
+  VLESS_ENCRYPTION=none
+  if [[ $PROXY_MODE == vless-xhttp-encryption ]]; then
+    if [[ -e $ENCRYPTION_PATH || -L $ENCRYPTION_PATH ]]; then
+      [[ -r $ENCRYPTION_PATH && -s $ENCRYPTION_PATH ]] || die "VLESS 密钥文件为空或不可读。"
+      VLESS_DECRYPTION=$(read_json_string "$ENCRYPTION_PATH" decryption)
+      VLESS_ENCRYPTION=$(read_json_string "$ENCRYPTION_PATH" encryption)
+      validate_vless_keys || die "VLESS 密钥文件无效，已停止以避免更换现有密钥。"
+    elif [[ $existing_mode == vless-xhttp-encryption ]]; then
+      die "现有加密配置缺少 ${ENCRYPTION_PATH}，已停止以避免旧客户端失效。请恢复该文件。"
+    fi
+    if [[ $existing_mode == vless-xhttp-encryption && $VLESS_DECRYPTION != "$existing_decryption" ]]; then
+      die "现有配置与 VLESS 密钥文件不匹配，已停止。"
     fi
   fi
 
@@ -440,7 +524,7 @@ collect_configuration() {
   if [[ -z "$WS_PATH" ]]; then
     WS_PATH="/$(random_hex 12)/$(random_hex 16)"
   fi
-  validate_ws_path "$WS_PATH" || die "WS_PATH 必须是 16-120 位安全路径，且不能以 / 结尾。"
+  validate_ws_path "$WS_PATH" || die "WS_PATH（WS/XHTTP 共用）必须是 16-120 位安全路径，且不能以 / 结尾。"
 
   validate_port "$ORIGIN_PORT" || die "ORIGIN_PORT 必须是 1024-65535 之间的端口。"
   ORIGIN_PORT=$((10#$ORIGIN_PORT))
@@ -481,6 +565,9 @@ create_service_user() {
 }
 
 capture_service_state() {
+  EDGE_WAS_ACTIVE=false EDGE_WAS_ENABLED=false
+  NGINX_WAS_ACTIVE=false NGINX_WAS_ENABLED=false
+  TUNNEL_WAS_ACTIVE=false TUNNEL_WAS_ENABLED=false
   systemctl is-active --quiet "$SERVICE_NAME" && EDGE_WAS_ACTIVE=true || true
   systemctl is-enabled --quiet "$SERVICE_NAME" && EDGE_WAS_ENABLED=true || true
   systemctl is-active --quiet nginx && NGINX_WAS_ACTIVE=true || true
@@ -493,22 +580,37 @@ restore_service_state() {
   local unit=$1
   local was_active=$2
   local was_enabled=$3
+  local failed=0
 
   if systemctl cat "$unit" >/dev/null 2>&1; then
     if [[ $was_enabled == "true" ]]; then
-      systemctl enable "$unit" >/dev/null 2>&1 || true
+      systemctl enable "$unit" >/dev/null 2>&1 || failed=1
     else
-      systemctl disable "$unit" >/dev/null 2>&1 || true
+      systemctl disable "$unit" >/dev/null 2>&1 || failed=1
     fi
 
     if [[ $was_active == "true" ]]; then
-      systemctl restart "$unit" >/dev/null 2>&1 || true
+      if [[ $unit == nginx ]] && systemctl is-active --quiet nginx; then
+        systemctl reload nginx >/dev/null 2>&1 || failed=1
+      else
+        systemctl restart "$unit" >/dev/null 2>&1 || failed=1
+      fi
     else
-      systemctl stop "$unit" >/dev/null 2>&1 || true
+      systemctl stop "$unit" >/dev/null 2>&1 || failed=1
     fi
   else
-    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    if [[ $was_active == true || $was_enabled == true ]]; then
+      failed=1
+    else
+      # A newly installed unit may still be running after its file was removed.
+      if systemctl is-active --quiet "$unit"; then
+        systemctl stop "$unit" >/dev/null 2>&1 || failed=1
+      fi
+      systemctl disable "$unit" >/dev/null 2>&1 || true
+    fi
   fi
+  ((failed == 0)) || warn "无法完整恢复 ${unit} 的服务状态，请手动检查。"
+  return "$failed"
 }
 
 cleanup_file_stage() {
@@ -570,14 +672,18 @@ rollback_installation() {
     fi
   done
 
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  restore_service_state "$SERVICE_NAME" "$EDGE_WAS_ACTIVE" "$EDGE_WAS_ENABLED"
-  restore_service_state nginx "$NGINX_WAS_ACTIVE" "$NGINX_WAS_ENABLED"
-  restore_service_state "$TUNNEL_SERVICE_NAME" "$TUNNEL_WAS_ACTIVE" "$TUNNEL_WAS_ENABLED"
+  if [[ $SERVICE_STATE_DIRTY == true ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || { failed=1; warn "systemd 重新加载失败。"; }
+    restore_service_state "$SERVICE_NAME" "$EDGE_WAS_ACTIVE" "$EDGE_WAS_ENABLED" || failed=1
+    restore_service_state nginx "$NGINX_WAS_ACTIVE" "$NGINX_WAS_ENABLED" || failed=1
+    restore_service_state "$TUNNEL_SERVICE_NAME" "$TUNNEL_WAS_ACTIVE" "$TUNNEL_WAS_ENABLED" || failed=1
+  fi
   if ((failed)); then
-    warn "部分文件未能回滚，请根据上方路径手动检查；已尝试恢复服务状态。"
+    warn "部分文件或服务未能回滚，请根据上方信息手动检查。"
+  elif [[ -n $BACKUP_DIR ]]; then
+    warn "已完成回滚，备份文件保留在 ${BACKUP_DIR}。"
   else
-    warn "配置文件已恢复；已尝试恢复原服务状态，备份文件保留在 ${BACKUP_ROOT}。"
+    warn "已完成回滚。"
   fi
   return "$failed"
 }
@@ -652,11 +758,78 @@ install_sing_box() {
   success "sing-box 官方发布包校验并安装完成。"
 }
 
+install_xray() {
+  local arch expected_hash archive extract_dir
+  read -r arch expected_hash < <(detect_xray_arch)
+  TEMP_DIR=${TEMP_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/edge-install.XXXXXXXX")}
+  archive="${TEMP_DIR}/xray.zip"
+  extract_dir="${TEMP_DIR}/xray"
+  info "下载 Xray ${XRAY_VERSION} 官方 ${arch} 发布包……"
+  download_file "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-${arch}.zip" "$archive"
+  [[ $(sha256_file "$archive") == "$expected_hash" ]] || die "Xray 发布包 SHA-256 校验失败。"
+  mkdir -p "$extract_dir"
+  unzip -q "$archive" xray -d "$extract_dir"
+  [[ -f ${extract_dir}/xray ]] || die "Xray 发布包结构不符合预期。"
+  install -d -m 0755 "$(dirname "$SING_BOX_BIN")"
+  backup_file "$SING_BOX_BIN"
+  install_managed_file root root 0755 "${extract_dir}/xray" "$SING_BOX_BIN"
+  success "Xray 官方发布包校验并安装完成。"
+}
+
+validate_vless_keys() {
+  # Use the short X25519 authentication pair from the pinned xray vlessenc.
+  # Its ephemeral key exchange also uses ML-KEM; this is not PQ authentication.
+  [[ $VLESS_DECRYPTION =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]{43}$ ]] &&
+    [[ $VLESS_ENCRYPTION =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]{43}$ ]]
+}
+
+prepare_vless_encryption() {
+  local generated
+  [[ $PROXY_MODE == vless-xhttp-encryption ]] || return 0
+  if [[ $VLESS_DECRYPTION == none && $VLESS_ENCRYPTION == none ]]; then
+    generated=$("$SING_BOX_BIN" vlessenc) || die "生成 VLESS Encryption 密钥失败。"
+    VLESS_DECRYPTION=$(awk -F '"' '/^"decryption":/ { print $4; exit }' <<<"$generated")
+    VLESS_ENCRYPTION=$(awk -F '"' '/^"encryption":/ { print $4; exit }' <<<"$generated")
+    unset generated
+  fi
+  validate_vless_keys || die "Xray 返回的 VLESS Encryption 密钥格式不符合预期。"
+}
+
+render_core_configuration() {
+  if [[ $PROXY_MODE == vmess-ws ]]; then
+    render_file "${TEMPLATE_DIR}/sing-box.json.tpl" "$1"
+  else
+    render_file "${TEMPLATE_DIR}/xray.json.tpl" "$1"
+  fi
+}
+
+check_core_configuration() {
+  if [[ $PROXY_MODE == vmess-ws ]]; then
+    "$SING_BOX_BIN" check -c "$1"
+  else
+    "$SING_BOX_BIN" run -test -config "$1"
+  fi
+}
+
 render_file() {
   local template=$1
   local destination=$2
+  local location_template="${TEMPLATE_DIR}/nginx-ws-location.conf.tpl"
+  local core_args="run -c"
+  if [[ $PROXY_MODE != vmess-ws ]]; then
+    location_template="${TEMPLATE_DIR}/nginx-xhttp-location.conf.tpl"
+    core_args="run -config"
+  fi
 
-  sed \
+  awk -v fragment="$location_template" '
+    /\{\{PROXY_LOCATION\}\}/ {
+      while ((result = getline line < fragment) > 0) print line
+      if (result < 0) exit 1
+      close(fragment)
+      next
+    }
+    { print }
+  ' "$template" | sed \
     -e "s|{{UUID}}|${CUSTOM_UUID}|g" \
     -e "s|{{WS_PATH}}|${WS_PATH}|g" \
     -e "s|{{PUBLIC_DOMAIN}}|${PUBLIC_DOMAIN}|g" \
@@ -666,7 +839,10 @@ render_file() {
     -e "s|{{TLS_CERT_PATH}}|${TLS_CERT_PATH}|g" \
     -e "s|{{TLS_KEY_PATH}}|${TLS_KEY_PATH}|g" \
     -e "s|{{SING_BOX_BIN}}|${SING_BOX_BIN}|g" \
+    -e "s|{{CORE_EXEC_ARGS}}|${core_args}|g" \
+    -e "s|{{VLESS_DECRYPTION}}|${VLESS_DECRYPTION}|g" \
     -e "s|{{CONFIG_PATH}}|${CONFIG_PATH}|g" \
+    -e "s|{{MANAGER_DIR}}|${MANAGER_DIR}|g" \
     -e "s|{{CLOUDFLARED_BIN}}|${CLOUDFLARED_BIN}|g" \
     -e "s|{{TOKEN_FILE}}|${TOKEN_PATH}|g" \
     -e "s|{{SITE_NONCE}}|${SITE_NONCE}|g" \
@@ -678,7 +854,7 @@ render_file() {
     -e "s|{{SITE_HEADING}}|${SITE_HEADING}|g" \
     -e "s|{{SITE_SUMMARY}}|${SITE_SUMMARY}|g" \
     -e "s|{{SITE_STATE}}|${SITE_STATE}|g" \
-    "$template" >"$destination"
+    >"$destination"
 }
 
 render_site() {
@@ -705,7 +881,7 @@ write_configuration() {
   rendered_site="${TEMP_DIR}/index.html"
   rendered_tunnel="${TEMP_DIR}/edge-tunnel.service"
 
-  render_file "${TEMPLATE_DIR}/sing-box.json.tpl" "$rendered_config"
+  render_core_configuration "$rendered_config"
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
     nginx_template="${TEMPLATE_DIR}/nginx-tunnel.conf.tpl"
   else
@@ -715,11 +891,18 @@ write_configuration() {
   render_file "${TEMPLATE_DIR}/edge-router.service.tpl" "$rendered_service"
   render_site "$rendered_site"
 
-  "$SING_BOX_BIN" check -c "$rendered_config"
+  check_core_configuration "$rendered_config"
 
   install -d -o root -g edge-router -m 0750 "$CONFIG_DIR"
   install -d -o root -g root -m 0755 "$SITE_ROOT"
   install -d -o root -g root -m 0755 "$(dirname "$NGINX_CONFIG")"
+
+  if [[ $PROXY_MODE == vless-xhttp-encryption ]]; then
+    validate_vless_keys || die "VLESS Encryption 密钥未准备好。"
+    printf '{"decryption":"%s","encryption":"%s"}\n' "$VLESS_DECRYPTION" "$VLESS_ENCRYPTION" >"${TEMP_DIR}/vless-keys.json"
+    backup_file "$ENCRYPTION_PATH"
+    install_managed_file root root 0600 "${TEMP_DIR}/vless-keys.json" "$ENCRYPTION_PATH"
+  fi
 
   backup_file "$CONFIG_PATH"
   backup_file "$NGINX_CONFIG"
@@ -729,6 +912,11 @@ write_configuration() {
   install_managed_file root root 0644 "$rendered_nginx" "$NGINX_CONFIG"
   install_managed_file root root 0644 "$rendered_site" "${SITE_ROOT}/index.html"
   install_managed_file root root 0644 "$rendered_service" "${SYSTEMD_DIR}/${SERVICE_NAME}.service"
+
+  printf '{"proxy_mode":"%s","deploy_mode":"%s","public_domain":"%s","origin_port":%s}\n' \
+    "$PROXY_MODE" "$DEPLOY_MODE" "$PUBLIC_DOMAIN" "$ORIGIN_PORT" >"${TEMP_DIR}/install-state.json"
+  backup_file "$STATE_PATH"
+  install_managed_file root root 0600 "${TEMP_DIR}/install-state.json" "$STATE_PATH"
 
   if [[ $DEPLOY_MODE == "direct" ]]; then
     install -d -o root -g root -m 0700 "${CONFIG_DIR}/tls"
@@ -745,15 +933,53 @@ write_configuration() {
   fi
 }
 
-write_client_link() {
-  local client_json encoded_link
+check_manager_destination() {
+  if [[ -e $COMMAND_PATH || -L $COMMAND_PATH ]]; then
+    [[ -f $COMMAND_PATH && ! -L $COMMAND_PATH ]] &&
+      grep -Fqx '# fczd: ibmfree managed entry' "$COMMAND_PATH" || die "${COMMAND_PATH} 已被其他程序使用，未覆盖。"
+  fi
+  [[ ! -L $MANAGER_DIR && ! -L ${MANAGER_DIR}/templates ]] || die "管理器目录不能是符号链接。"
+  if [[ -e $MANAGER_DIR ]]; then
+    [[ -d $MANAGER_DIR && -f ${MANAGER_DIR}/.fczd-managed ]] &&
+      grep -Fqx 'ibmfree-fczd-v1' "${MANAGER_DIR}/.fczd-managed" || die "${MANAGER_DIR} 不是本项目的管理器目录，未覆盖。"
+  fi
+}
 
-  client_json=$(printf \
+install_management() {
+  local name rendered_command
+  check_manager_destination
+  [[ -d $MANAGER_DIR ]] || MANAGER_CREATED=true
+  install -d -o root -g root -m 0755 "$MANAGER_DIR" "${MANAGER_DIR}/templates" "${COMMAND_PATH%/*}"
+  backup_file "${MANAGER_DIR}/install.sh"
+  install_managed_file root root 0644 "${SCRIPT_DIR}/install.sh" "${MANAGER_DIR}/install.sh"
+  for name in "${MANAGED_TEMPLATES[@]}"; do
+    backup_file "${MANAGER_DIR}/templates/${name}"
+    install_managed_file root root 0644 "${TEMPLATE_DIR}/${name}" "${MANAGER_DIR}/templates/${name}"
+  done
+  backup_file "${MANAGER_DIR}/.fczd-managed"
+  printf 'ibmfree-fczd-v1\n' >"${TEMP_DIR}/manager.marker"
+  install_managed_file root root 0644 "${TEMP_DIR}/manager.marker" "${MANAGER_DIR}/.fczd-managed"
+  rendered_command="${TEMP_DIR}/fczd"
+  render_file "${TEMPLATE_DIR}/fczd-command.tpl" "$rendered_command"
+  backup_file "$COMMAND_PATH"
+  install_managed_file root root 0755 "$rendered_command" "$COMMAND_PATH"
+}
+
+write_client_link() {
+  local client_json encoded_link client_uri
+
+  if [[ $PROXY_MODE == vmess-ws ]]; then
+    client_json=$(printf \
     '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","scy":"auto","net":"ws","type":"none","host":"%s","path":"%s","tls":"tls","sni":"%s","fp":"chrome"}' \
     "$PUBLIC_DOMAIN" "$PUBLIC_DOMAIN" "$CUSTOM_UUID" "$PUBLIC_DOMAIN" "$WS_PATH" "$PUBLIC_DOMAIN")
-  encoded_link=$(printf '%s' "$client_json" | base64 | tr -d '\r\n')
+    encoded_link=$(printf '%s' "$client_json" | base64 | tr -d '\r\n')
+    client_uri="vmess://${encoded_link}"
+  else
+    # All values are validated ASCII. Encode slashes in the path for URI clients.
+    client_uri="vless://${CUSTOM_UUID}@${PUBLIC_DOMAIN}:443?encryption=${VLESS_ENCRYPTION}&security=tls&sni=${PUBLIC_DOMAIN}&fp=chrome&type=xhttp&host=${PUBLIC_DOMAIN}&path=${WS_PATH//\//%2F}&mode=packet-up#${PUBLIC_DOMAIN}"
+  fi
   backup_file "$CLIENT_PATH"
-  printf 'vmess://%s\n' "$encoded_link" | install_managed_file root root 0600 /dev/stdin "$CLIENT_PATH"
+  printf '%s\n' "$client_uri" | install_managed_file root root 0600 /dev/stdin "$CLIENT_PATH"
 }
 
 local_http_request() {
@@ -780,6 +1006,17 @@ check_local_site() {
   for attempt in 1 2 3 4 5; do
     status=$(local_http_request / --write-out '%{http_code}') || status="000"
     if [[ $status == "200" ]]; then
+      if [[ $PROXY_MODE != vmess-ws ]]; then
+        # A real packet-up POST checks nginx -> Xray, not just the static page.
+        # This intentionally does not claim UUID/Encryption or public TLS health.
+        status=$(local_http_request "${WS_PATH}/$(generate_uuid)/0" \
+          --request POST --data-binary '' \
+          --header "Referer: https://${PUBLIC_DOMAIN}/?x_padding=$(printf '%100s' '' | tr ' ' X)" \
+          --write-out '%{http_code}') || status="000"
+        [[ $status != 200 ]] || return 0
+        ((attempt == 5)) || sleep 1
+        continue
+      fi
       : >"$headers"
       curl_status=0
       local_http_request "$WS_PATH" --dump-header "$headers" \
@@ -806,7 +1043,7 @@ check_local_site() {
     ((attempt == 5)) || sleep 1
   done
 
-  die "本地 HTTP/WebSocket 检查失败（首页 HTTP: ${status}）。请检查 edge-router/nginx 服务和监听端口；未确认公网连通。"
+  die "本地 HTTP/代理传输检查失败（HTTP: ${status}）。请检查 edge-router/nginx 服务和监听端口；未确认公网连通。"
 }
 
 warn_extra_tcp_listeners() {
@@ -856,6 +1093,7 @@ activate_services() {
     fi
   fi
 
+  SERVICE_STATE_DIRTY=true
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" nginx >/dev/null
   systemctl restart "$SERVICE_NAME"
@@ -890,11 +1128,13 @@ show_summary() {
   printf '  模式: %s\n' "$DEPLOY_MODE"
   printf '  客户端配置: %s（仅 root 可读）\n' "$CLIENT_PATH"
   printf '  核心配置: %s\n' "$CONFIG_PATH"
+  printf '  管理命令: fczd\n'
   if [[ -n $BACKUP_DIR ]]; then
     printf '  本次备份: %s（仅 root 可读；paths.tsv 记录原路径）\n' "$BACKUP_DIR"
   fi
-  printf '  WebSocket 路径: %s…%s\n' "${WS_PATH:0:12}" "${WS_PATH: -4}"
-  printf '\n%b\n' "${COLOR_GREEN}VMess 链接:${COLOR_RESET}"
+  printf '  代理方案: %s\n' "$PROXY_MODE"
+  printf '  代理路径: %s…%s\n' "${WS_PATH:0:12}" "${WS_PATH: -4}"
+  printf '\n%b\n' "${COLOR_GREEN}客户端链接:${COLOR_RESET}"
   cat "$CLIENT_PATH"
 
   if [[ $DEPLOY_MODE == "tunnel" ]]; then
@@ -902,22 +1142,309 @@ show_summary() {
   else
     warn "direct 模式请确保域名已解析到本机，并仅开放必要的 443/TCP 入站。"
   fi
-  warn "已验证本地 HTTP/WebSocket；仍需使用客户端确认公网 Tunnel/TLS 和 VMess 认证连通。"
+  warn "已验证本地 HTTP/代理传输；仍需导入链接确认公网 Tunnel/TLS、UUID 和可选 Encryption 连通。"
+}
+
+installed_proxy_mode() {
+  local protocols decryption
+  [[ -s $CONFIG_PATH ]] || return 1
+  protocols=$(read_json_string "$CONFIG_PATH" protocol)
+  if [[ ${protocols%%$'\n'*} == vless ]]; then
+    [[ $(read_json_string "$CONFIG_PATH" network) == xhttp ]] || return 1
+    decryption=$(read_json_string "$CONFIG_PATH" decryption)
+    [[ -n $decryption && $decryption != *$'\n'* ]] || return 1
+    if [[ $decryption == none ]]; then printf 'vless-xhttp'; else printf 'vless-xhttp-encryption'; fi
+  elif validate_uuid "$(read_json_string "$CONFIG_PATH" uuid)"; then
+    printf 'vmess-ws'
+  else
+    return 1
+  fi
+}
+
+installed_deploy_mode() {
+  local mode
+  mode=$(read_json_string "$STATE_PATH" deploy_mode)
+  if [[ $mode == tunnel || $mode == direct ]]; then
+    printf '%s' "$mode"
+  elif [[ -r $NGINX_CONFIG ]] && grep -Eq 'listen[[:space:]]+127\.0\.0\.1:' "$NGINX_CONFIG"; then
+    printf tunnel
+  elif [[ -r $NGINX_CONFIG ]] && grep -Eq 'listen[[:space:]]+443[[:space:]]+ssl' "$NGINX_CONFIG"; then
+    printf direct
+  else
+    return 1
+  fi
+}
+
+installed_origin_port() {
+  local mode=${1,,} port
+  port=$(read_json_number "$STATE_PATH" origin_port)
+  if [[ -z $port && $mode == tunnel && -r $NGINX_CONFIG ]]; then
+    port=$(sed -nE 's/^[[:space:]]*listen 127\.0\.0\.1:([0-9]+).*;/\1/p' "$NGINX_CONFIG" | sort -u)
+  fi
+  port=${port:-8001}
+  validate_port "$port" || return 1
+  printf '%s' "$((10#$port))"
+}
+
+load_management_configuration() {
+  PROXY_MODE=$(installed_proxy_mode) || die "没有可识别的已安装配置，请先安装或检查 ${CONFIG_PATH}。"
+  DEPLOY_MODE=$(installed_deploy_mode) || die "无法识别部署模式，请检查本项目 Nginx 配置。"
+  if [[ -z $PUBLIC_DOMAIN ]]; then
+    PUBLIC_DOMAIN=$(read_json_string "$STATE_PATH" public_domain)
+    if [[ -z $PUBLIC_DOMAIN && -r $NGINX_CONFIG ]]; then
+      PUBLIC_DOMAIN=$(awk '$1 == "server_name" && $2 != "_;" { sub(/;$/, "", $2); print $2; exit }' "$NGINX_CONFIG")
+    fi
+  fi
+  WS_PATH=$(read_json_string "$CONFIG_PATH" path)
+  if [[ $PROXY_MODE == vmess-ws ]]; then
+    SING_BOX_PORT=$(read_json_number "$CONFIG_PATH" listen_port)
+  else
+    SING_BOX_PORT=$(read_json_number "$CONFIG_PATH" port)
+  fi
+  ORIGIN_PORT=$(installed_origin_port "$DEPLOY_MODE") || die "已安装配置的入口端口无效。"
+  validate_domain "$PUBLIC_DOMAIN" && validate_ws_path "$WS_PATH" &&
+    validate_port "$SING_BOX_PORT" && validate_port "$ORIGIN_PORT" || die "已安装配置的域名、路径或端口无效。"
+}
+
+list_installed() {
+  local profile="" mode="" domain="" selected unit state version=""
+  profile=$(installed_proxy_mode) || true
+  mode=$(installed_deploy_mode) || true
+  domain=$(read_json_string "$STATE_PATH" public_domain)
+  printf '代理方案（同一时间只安装一种）：\n'
+  for selected in vmess-ws vless-xhttp vless-xhttp-encryption; do
+    state="未安装"
+    if [[ $selected == "$profile" ]]; then
+      if [[ -x $SING_BOX_BIN ]]; then state="已安装"; else state="配置存在，核心缺失"; fi
+    fi
+    printf '  %-26s %s\n' "$selected" "$state"
+  done
+  if [[ -z $profile && -e $CONFIG_PATH ]]; then warn "核心配置存在但无法识别，请检查 ${CONFIG_PATH}。"; fi
+  [[ -z $mode ]] || printf '部署模式: %s\n' "$mode"
+  if validate_domain "$domain"; then printf '公网域名: %s\n' "$domain"; fi
+  if [[ -x $SING_BOX_BIN ]]; then
+    version=$("$SING_BOX_BIN" version 2>/dev/null) || version="版本读取失败"
+    printf '核心: %s\n' "${version%%$'\n'*}"
+  fi
+  for unit in "$SERVICE_NAME" "$TUNNEL_SERVICE_NAME" nginx; do
+    state=$(systemctl is-active "$unit" 2>/dev/null) || true
+    printf '  %-12s %s\n' "$unit" "${state:-unknown}"
+  done
+  printf '管理入口: %s\n' "$COMMAND_PATH"
+}
+
+manage_install() {
+  local requested_profile=${1:-$PROXY_MODE}
+  local requested_path=$WS_PATH requested_core_port=$SING_BOX_PORT
+  preflight_environment
+  acquire_install_lock
+  if [[ -s $CONFIG_PATH ]]; then
+    load_management_configuration
+    WS_PATH=${requested_path:-$WS_PATH}
+    SING_BOX_PORT=${requested_core_port:-$SING_BOX_PORT}
+    DEPLOY_MODE=${REQUESTED_DEPLOY_MODE:-$DEPLOY_MODE}
+    DEPLOY_MODE=${DEPLOY_MODE,,}
+    ORIGIN_PORT=${REQUESTED_ORIGIN_PORT:-$ORIGIN_PORT}
+    if [[ $DEPLOY_MODE == tunnel && -z $TUNNEL_TOKEN_FILE && -s $TOKEN_PATH ]]; then
+      TUNNEL_TOKEN_FILE=$TOKEN_PATH
+    elif [[ $DEPLOY_MODE == direct ]]; then
+      if [[ -z $TLS_CERT_FILE && -s $TLS_CERT_PATH ]]; then TLS_CERT_FILE=$TLS_CERT_PATH; fi
+      if [[ -z $TLS_KEY_FILE && -s $TLS_KEY_PATH ]]; then TLS_KEY_FILE=$TLS_KEY_PATH; fi
+    fi
+  fi
+  PROXY_MODE=$requested_profile
+  main
+}
+
+manage_services() {
+  local action=$1
+  local unit
+  preflight_environment
+  acquire_install_lock
+  if [[ $action != stop ]]; then
+    load_management_configuration
+    [[ -x $SING_BOX_BIN ]] || die "核心程序不存在，请重新安装。"
+    check_core_configuration "$CONFIG_PATH"
+    nginx -t
+  fi
+  capture_service_state
+  ROLLBACK_ACTIVE=true
+  SERVICE_STATE_DIRTY=true
+  if [[ $action == stop ]]; then
+    for unit in "$TUNNEL_SERVICE_NAME" "$SERVICE_NAME"; do
+      if systemctl cat "$unit" >/dev/null 2>&1 || systemctl is-active --quiet "$unit"; then
+        systemctl stop "$unit"
+        if systemctl is-active --quiet "$unit"; then die "${unit} 未停止。"; fi
+      fi
+    done
+  else
+    systemctl "$action" "$SERVICE_NAME"
+    if systemctl is-active --quiet nginx; then systemctl reload nginx; else systemctl start nginx; fi
+    if [[ $DEPLOY_MODE == tunnel ]]; then systemctl "$action" "$TUNNEL_SERVICE_NAME"; fi
+    check_local_site
+  fi
+  ROLLBACK_ACTIVE=false
+  SERVICE_STATE_DIRTY=false
+  success "服务操作完成: ${action}"
+}
+
+manage_site() {
+  local html_file=${1-}
+  [[ -s $CONFIG_PATH && -d $SITE_ROOT ]] || die "请先安装。"
+  read_value html_file "新的本地 HTML 首页路径"
+  [[ -f $html_file && -s $html_file ]] || die "首页文件不存在或为空。"
+  preflight_environment
+  acquire_install_lock
+  capture_service_state
+  backup_file "${SITE_ROOT}/index.html"
+  install_managed_file root root 0644 "$html_file" "${SITE_ROOT}/index.html"
+  ROLLBACK_ACTIVE=false
+  success "首页已更新。原首页备份保存在 ${BACKUP_DIR}。"
+}
+
+uninstall_deployment() {
+  local confirmation="" target name unit
+  local -a targets=(
+    "$NGINX_CONFIG" "${SYSTEMD_DIR}/${SERVICE_NAME}.service" "${SYSTEMD_DIR}/${TUNNEL_SERVICE_NAME}.service"
+    "$CONFIG_PATH" "$CLIENT_PATH" "$ENCRYPTION_PATH" "$STATE_PATH" "$TOKEN_PATH" "$TLS_CERT_PATH" "$TLS_KEY_PATH"
+    "$SING_BOX_BIN" "$COMMAND_PATH" "${MANAGER_DIR}/install.sh" "${MANAGER_DIR}/.fczd-managed"
+  )
+  [[ ${1-} == '' || ${1-} == --yes ]] || die "卸载参数只接受 --yes。"
+  check_manager_destination
+  printf '将停止本项目服务，移除配置/密钥、Nginx 站点、核心和 fczd 管理入口。\n'
+  printf '保留 Nginx/cloudflared 软件包、服务账户、静态站点目录、历史备份和系统日志。\n'
+  if [[ ${1-} != --yes ]]; then
+    read_value confirmation "输入 UNINSTALL 确认卸载"
+    [[ $confirmation == UNINSTALL ]] || { info "已取消卸载。"; return 0; }
+  fi
+  preflight_environment
+  acquire_install_lock
+  check_manager_destination
+  capture_service_state
+  for name in "${MANAGED_TEMPLATES[@]}"; do targets+=("${MANAGER_DIR}/templates/${name}"); done
+  # Snapshot every managed file before stopping anything. The normal EXIT/signal
+  # rollback restores files and service states if a removal/reload fails.
+  for target in "${targets[@]}"; do backup_file "$target"; done
+  for unit in "$TUNNEL_SERVICE_NAME" "$SERVICE_NAME"; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      SERVICE_STATE_DIRTY=true
+      systemctl disable --now "$unit"
+      if systemctl is-active --quiet "$unit"; then die "${unit} 未停止，已中止卸载。"; fi
+    fi
+  done
+  rm -f -- "$NGINX_CONFIG"
+  if command -v nginx >/dev/null 2>&1; then nginx -t; fi
+  if [[ $NGINX_WAS_ACTIVE == true ]]; then SERVICE_STATE_DIRTY=true; systemctl reload nginx; fi
+  for target in "${targets[@]}"; do rm -f -- "$target"; done
+  SERVICE_STATE_DIRTY=true
+  systemctl daemon-reload
+  ROLLBACK_ACTIVE=false
+  rmdir -- "${CONFIG_DIR}/tls" "$CONFIG_DIR" "${MANAGER_DIR}/templates" "$MANAGER_DIR" 2>/dev/null || true
+  success "卸载完成。备份保留在 ${BACKUP_DIR:-$BACKUP_ROOT}；静态站点保留在 ${SITE_ROOT}。"
+}
+
+manager_menu() {
+  local choice command
+  while true; do
+    printf '\nFCZD 管理菜单\n1) 安装 / 切换方案\n2) 列出已安装\n3) 服务状态\n4) 重启\n5) 停止\n6) 启动\n7) 检查配置与本地链路\n8) 显示客户端链接\n9) 更换网站首页\n10) 卸载\n0) 退出\n'
+    choice=""
+    read_value choice "请选择" 0
+    case $choice in
+      0) return 0 ;; 1) command=install ;; 2) command=list ;; 3) command=status ;;
+      4) command=restart ;; 5) command=stop ;; 6) command=start ;; 7) command=check ;;
+      8) command=link ;; 9) command=site ;; 10) command=uninstall ;;
+      *) warn "无效选项。"; continue ;;
+    esac
+    # A fresh Bash keeps errexit/rollback active even though this parent handles
+    # a failed command and returns to the menu. Never call mutations in `if fn`.
+    if ! bash "${SCRIPT_DIR}/install.sh" --manage "$command"; then warn "操作失败，请检查上方信息。"; fi
+    if [[ $command == uninstall && ! -e $COMMAND_PATH && ! -e $CONFIG_PATH ]]; then return 0; fi
+  done
+}
+
+validate_manager_arguments() {
+  local action=${1:-menu}
+  (($# == 0)) || shift
+  case $action in
+    install)
+      (($# <= 1)) || die "用法: fczd install [1/2/3]"
+      if (($#)); then
+        case $1 in 1 | 2 | 3 | vmess-ws | vless-xhttp | vless-xhttp-encryption) : ;; *) die "无效的代理方案: $1" ;; esac
+      fi
+      ;;
+    site) (($# <= 1)) || die "用法: fczd site [HTML文件]" ;;
+    uninstall)
+      (($# <= 1)) && [[ ${1-} == '' || ${1-} == --yes ]] || die "用法: fczd uninstall [--yes]"
+      ;;
+    menu | list | status | start | stop | restart | check | link | help | --help | -h)
+      (($# == 0)) || die "${action} 不接受额外参数。"
+      ;;
+    *) die "未知命令: ${action}。运行 fczd help 查看用法。" ;;
+  esac
+}
+
+show_service_status() {
+  local status=0
+  # Status output is often copied to support chats. Keep journal history opt-in.
+  systemctl --no-pager --full --lines=0 status "$SERVICE_NAME" "$TUNNEL_SERVICE_NAME" nginx || status=$?
+  ((status == 0 || status == 3 || status == 4)) || return "$status"
+}
+
+manager_main() {
+  local action=${1:-menu}
+  validate_manager_arguments "$@"
+  if [[ $action == help || $action == --help || $action == -h ]]; then
+    printf 'fczd [menu|install [1/2/3]|list|status|start|stop|restart|check|link|site [HTML文件]|uninstall [--yes]]\n'
+    return 0
+  fi
+  if ((EUID != 0)); then
+    command -v sudo >/dev/null 2>&1 || die "请先 sudo -i 切换到 root，再运行 fczd。"
+    exec sudo -- /bin/bash "${SCRIPT_DIR}/install.sh" --manage "$@"
+  fi
+  (($# == 0)) || shift
+  case $action in
+    menu) manager_menu ;;
+    install) manage_install "$@" ;;
+    list) list_installed ;;
+    status)
+      list_installed
+      show_service_status
+      ;;
+    start | stop | restart) manage_services "$action" ;;
+    check)
+      preflight_environment
+      acquire_install_lock
+      load_management_configuration
+      check_core_configuration "$CONFIG_PATH"
+      check_local_site
+      warn_extra_tcp_listeners
+      success "本地检查通过；公网 Cloudflare/TLS 仍需客户端验证。"
+      ;;
+    link) [[ -s $CLIENT_PATH ]] || die "没有客户端链接，请先安装。"; cat "$CLIENT_PATH" ;;
+    site) manage_site "$@" ;;
+    uninstall) uninstall_deployment "$@" ;;
+    *) die "未知命令: ${action}。运行 fczd help 查看用法。" ;;
+  esac
 }
 
 main() {
   ((EUID == 0)) || die "请使用 sudo 运行此脚本。"
   [[ $(uname -s) == "Linux" ]] || die "仅支持 Linux。"
   preflight_environment
+  check_manager_destination
   acquire_install_lock
   capture_service_state
 
   require_file "${TEMPLATE_DIR}/sing-box.json.tpl"
+  require_file "${TEMPLATE_DIR}/xray.json.tpl"
+  require_file "${TEMPLATE_DIR}/nginx-ws-location.conf.tpl"
+  require_file "${TEMPLATE_DIR}/nginx-xhttp-location.conf.tpl"
   require_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl"
   require_file "${TEMPLATE_DIR}/nginx-direct.conf.tpl"
   require_file "${TEMPLATE_DIR}/edge-router.service.tpl"
   require_file "${TEMPLATE_DIR}/edge-tunnel.service.tpl"
   require_file "${TEMPLATE_DIR}/index.html"
+  require_file "${TEMPLATE_DIR}/fczd-command.tpl"
 
   install_packages
   collect_configuration
@@ -926,13 +1453,24 @@ main() {
     ensure_cloudflared
   fi
   create_service_user
-  install_sing_box
+  if [[ $PROXY_MODE == vmess-ws ]]; then
+    install_sing_box
+  else
+    install_xray
+  fi
+  prepare_vless_encryption
   write_configuration
   write_client_link
+  install_management
   activate_services
   show_summary
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
-  main "$@"
+  if [[ ${1-} == --manage ]]; then
+    shift
+    manager_main "$@"
+  else
+    main "$@"
+  fi
 fi

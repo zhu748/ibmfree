@@ -28,6 +28,7 @@ install() {
 }
 
 CUSTOM_UUID=11111111-1111-4111-8111-111111111111
+PROXY_MODE=${4:-vmess-ws}
 PUBLIC_DOMAIN=edge.example.com
 WS_PATH="/$(random_hex 12)/$(random_hex 16)"
 SING_BOX_PORT=${2:?core port required}
@@ -36,7 +37,11 @@ validate_port "$SING_BOX_PORT" && validate_port "$ORIGIN_PORT" || die 'invalid f
 [[ $SING_BOX_PORT != "$ORIGIN_PORT" ]] || die 'fixture ports must differ'
 mkdir -p "$CONFIG_DIR" "${CONFIG_DIR}/tls" "$SITE_ROOT"
 printf '<html>VMess loopback fixture</html>\n' >"${SITE_ROOT}/index.html"
-render_file "${TEMPLATE_DIR}/sing-box.json.tpl" "$CONFIG_PATH"
+prepare_vless_encryption
+render_core_configuration "$CONFIG_PATH"
+if [[ $PROXY_MODE == vless-xhttp-encryption ]]; then
+  printf '{"decryption":"%s","encryption":"%s"}\n' "$VLESS_DECRYPTION" "$VLESS_ENCRYPTION" >"$ENCRYPTION_PATH"
+fi
 render_file "${TEMPLATE_DIR}/nginx-tunnel.conf.tpl" "${FIXTURE_ROOT}/tunnel.tpl.conf"
 render_file "${TEMPLATE_DIR}/nginx-direct.conf.tpl" "${FIXTURE_ROOT}/direct.tpl.conf"
 write_client_link

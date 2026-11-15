@@ -89,6 +89,7 @@ async function checkMode(mode) {
     TLS_CERT_PATH: path.join(root, 'cert.pem'), TLS_KEY_PATH: path.join(root, 'key.pem'),
   };
   let template = fs.readFileSync(path.join(repo, 'templates', `nginx-${mode}.conf.tpl`), 'utf8')
+    .replace('{{PROXY_LOCATION}}', fs.readFileSync(path.join(repo, 'templates/nginx-ws-location.conf.tpl'), 'utf8'))
     .replace(/\{\{([A-Z_]+)\}\}/g, (_, key) => {
       assert.ok(Object.hasOwn(values, key), `unknown placeholder ${key}`);
       return values[key];
@@ -101,7 +102,7 @@ async function checkMode(mode) {
   }
   fs.writeFileSync(conf, `worker_processes 1;\npid ${root}/${mode}.pid;\n` +
     `error_log ${error} warn;\nevents { worker_connections 128; }\nhttp {\nautoindex on;\n` +
-    `client_body_temp_path ${root}/client;\nproxy_temp_path ${root}/proxy;\n${template}\n}\n`, 'utf8');
+    `client_body_temp_path ${root}/client;\nproxy_temp_path ${root}/proxy;\nfastcgi_temp_path ${root}/fastcgi;\nuwsgi_temp_path ${root}/uwsgi;\nscgi_temp_path ${root}/scgi;\n${template}\n}\n`, 'utf8');
   run('nginx', ['-p', root + '/', '-c', conf, '-t']);
   let stderr = '';
   child = spawn('nginx', ['-p', root + '/', '-c', conf, '-g', 'daemon off; master_process off;']);
@@ -117,7 +118,7 @@ async function checkMode(mode) {
   assert.equal(baseline.status, 404);
   assert.ok(!/nginx|sing-box|vmess|edge-router/i.test(baseline.body));
   const privatePaths = ['/index.html.bak.20260101', '/index.html.restore.test', '/config.json',
-    '/client.txt', '/tunnel.token', '/.git/config', '/%2egit/config', '/index.html~',
+    '/client.txt', '/tunnel.token', '/vless-keys.json', '/install-state.json', '/.git/config', '/%2egit/config', '/index.html~',
     '/.edge-stage.fixture/payload', '/%2eedge-stage.fixture/payload'];
   for (const uri of [...privatePaths, wsPath]) {
     const res = await request(mode, port, uri);
@@ -173,7 +174,7 @@ async function checkMode(mode) {
     }
     assert.equal(hits, before, 'incomplete handshake reached backend');
   }
-  for (const code of [301, 302, 303, 307, 308, 400, 403, 404, 405, 426, 500, 502, 503, 504]) {
+  for (const code of [301, 302, 303, 307, 308, 400, 401, 403, 404, 405, 407, 426, 500, 502, 503, 504]) {
     failureCode = code;
     const before = hits;
     const res = await request(mode, port, wsPath, { headers: validHeaders });
@@ -211,6 +212,11 @@ async function checkMode(mode) {
     const valid = await request(mode, port, wsPath, { headers: { ...validHeaders,
       Connection: connection, Upgrade: 'WebSocket', 'Sec-WebSocket-Key': key } });
     assert.equal(valid.status, 101, `valid WebSocket rejected: ${connection}`);
+    for (const field of ['x-powered-by', 'x-runtime', 'x-aspnet-version', 'x-generator',
+      'x-backend-server', 'www-authenticate', 'proxy-authenticate']) {
+      assert.equal(valid.headers[field], undefined, `successful upgrade leaked ${field}`);
+    }
+    assert.ok(!JSON.stringify(valid.headers).includes('backend-build-sentinel'));
     assert.equal(valid.headers['sec-websocket-accept'], crypto.createHash('sha1')
       .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64'));
     assert.equal(hits, before + 1, 'valid handshake did not reach backend');
@@ -245,7 +251,7 @@ async function checkMode(mode) {
     fs.writeFileSync(path.join(site, 'index.html'), '<html>fixture site</html>', 'utf8');
     fs.writeFileSync(path.join(site, 'assets/public.txt'), 'public-asset-sentinel', 'utf8');
     for (const name of ['index.html.bak.20260101', 'index.html.restore.test', 'config.json',
-      'client.txt', 'tunnel.token', 'index.html~', '.git/config', '.edge-stage.fixture/payload']) {
+      'client.txt', 'tunnel.token', 'vless-keys.json', 'install-state.json', 'index.html~', '.git/config', '.edge-stage.fixture/payload']) {
       fs.writeFileSync(path.join(site, name), 'private-content-sentinel', 'utf8');
     }
     run('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
@@ -267,6 +273,9 @@ async function checkMode(mode) {
       const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] +
         '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
       socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n' +
+        'Server: backend-build-sentinel\r\nX-Powered-By: core-engine\r\nX-Runtime: core-runtime\r\n' +
+        'X-AspNet-Version: core-version\r\nX-Generator: core-generator\r\nX-Backend-Server: internal\r\n' +
+        'WWW-Authenticate: Basic realm="internal"\r\nProxy-Authenticate: Basic realm="internal"\r\n' +
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`);
     });
     backend.listen(0, '127.0.0.1');

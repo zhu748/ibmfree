@@ -14,7 +14,7 @@
 
 XHTTP 固定使用 `packet-up`，Nginx 关闭请求和响应缓冲、允许随机路径下的会话/序号子路径。Xray 的 `noSSEHeader` 开启；不依赖 Tunnel 公网域名的 gRPC 支持。这里的 TLS 由 Cloudflare（Tunnel 模式）或 Nginx（Direct 模式）提供，核心在回环地址接收 HTTP。
 
-方案 3 使用固定版本 `xray vlessenc` 生成的第一组 X25519 认证密钥，临时密钥交换使用 ML-KEM；这不等于使用后量子认证。客户端链接只包含客户端加密参数，服务端密钥另存于 root-only 的 `/etc/edge-router/vless-keys.json`，备份时请连同核心配置一起保存。重复安装、或切换到其他方案再切回来时复用这组密钥；已有加密配置丢失密钥文件时停止安装，避免静默生成新密钥使旧客户端失效。
+方案 3 使用固定版本 `xray vlessenc` 生成的密钥。`vlessenc` 输出两组认证，默认取第一组 X25519 认证（`VLESS_AUTH=x25519`，客户端链接较短）；设置 `VLESS_AUTH=mlkem768` 时取第二组，认证层也使用 ML-KEM-768，为完整后量子认证，代价是客户端链接约 1800 字符，导入时必须完整复制。两组的临时密钥交换都使用 ML-KEM，都能防止已录流量被未来量子计算机解密，区别只在认证层是否抗量子。两种认证不能混用；重装时未设置 `VLESS_AUTH` 会沿用现有密钥的认证形态（交互安装提示选 1/2，回车沿用现有形态），显式传入或交互选择不一致的形态则停止安装；更换认证形态请先卸载再重装。客户端链接只包含客户端加密参数，服务端密钥另存于 root-only 的 `/etc/edge-router/vless-keys.json`，备份时请连同核心配置一起保存。重复安装、或切换到其他方案再切回来时复用这组密钥；已有加密配置丢失密钥文件时停止安装，避免静默生成新密钥使旧客户端失效。
 
 方案 2 的 VLESS Encryption 关闭（`encryption=none`）。Cloudflare 会终止外层 TLS，因此若需要代理载荷在客户端和自己的核心之间继续加密，应选择方案 3。目的网站自己的 HTTPS 加密是另一层。
 
@@ -106,6 +106,12 @@ sudo bash install.sh
 sudo PROXY_MODE=vless-xhttp-encryption bash install.sh
 ```
 
+如需完整后量子认证（ML-KEM-768 认证，客户端链接约 1800 字符）：
+
+```bash
+sudo PROXY_MODE=vless-xhttp-encryption VLESS_AUTH=mlkem768 bash install.sh
+```
+
 要测试本地修改，应从克隆目录运行 `install.sh`；上方一键入口始终下载 GitHub `main` 分支。
 
 Direct 模式额外使用：
@@ -124,6 +130,7 @@ sudo PUBLIC_DOMAIN=edge.example.com \
 | --- | --- | --- |
 | `UUID` | 随机 | 客户端 UUID |
 | `PROXY_MODE` | 已有方案，否则 `vmess-ws` | 三选一，也接受 `1`、`2`、`3` |
+| `VLESS_AUTH` | `x25519` | 仅方案 3：`x25519`（默认，链接短）或 `mlkem768`/`pq`（ML-KEM-768 完整后量子认证，链接约 1800 字符）；交互安装时提示选 1（短链接）/2（长链接），回车沿用现有形态 |
 | `WS_PATH` | 两段完全随机路径 | WS/XHTTP 共用的路径变量，保留旧名称 |
 | `ORIGIN_PORT` | `8001` | Tunnel 模式的本地 Nginx 端口 |
 | `SING_BOX_PORT` | 随机空闲端口 | 所选核心的回环监听端口，保留旧名称 |

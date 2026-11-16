@@ -48,6 +48,8 @@ DEPLOY_MODE="${DEPLOY_MODE:-tunnel}"
 PROXY_MODE="${PROXY_MODE:-}"
 VLESS_DECRYPTION="none"
 VLESS_ENCRYPTION="none"
+VLESS_AUTH_REQUESTED="${VLESS_AUTH:-}"
+VLESS_AUTH="${VLESS_AUTH:-x25519}"
 CUSTOM_UUID="${UUID:-}"
 WS_PATH="${WS_PATH:-}"
 ORIGIN_PORT="${ORIGIN_PORT:-8001}"
@@ -481,6 +483,8 @@ collect_configuration() {
   local tunnel_token=""
   local existing_mode="vmess-ws" existing_decryption="none"
   local existing_protocols=""
+  local existing_auth=""
+  local chosen_auth=""
 
   if [[ -e $CONFIG_PATH || -L $CONFIG_PATH ]]; then
     [[ -r $CONFIG_PATH && -s $CONFIG_PATH ]] || die "现有配置为空或不可读，已停止以保留原连接参数: ${CONFIG_PATH}"
@@ -527,18 +531,45 @@ collect_configuration() {
   esac
   VLESS_DECRYPTION=none
   VLESS_ENCRYPTION=none
+  existing_auth=""
   if [[ $PROXY_MODE == vless-xhttp-encryption ]]; then
     if [[ -e $ENCRYPTION_PATH || -L $ENCRYPTION_PATH ]]; then
       [[ -r $ENCRYPTION_PATH && -s $ENCRYPTION_PATH ]] || die "VLESS 密钥文件为空或不可读。"
       VLESS_DECRYPTION=$(read_json_string "$ENCRYPTION_PATH" decryption)
       VLESS_ENCRYPTION=$(read_json_string "$ENCRYPTION_PATH" encryption)
       validate_vless_keys || die "VLESS 密钥文件无效，已停止以避免更换现有密钥。"
+      existing_auth=$(vless_keys_auth) || die "无法识别现有 VLESS 密钥的认证形态。"
     elif [[ $existing_mode == vless-xhttp-encryption ]]; then
       die "现有加密配置缺少 ${ENCRYPTION_PATH}，已停止以避免旧客户端失效。请恢复该文件。"
+    fi
+    # Explicit VLESS_AUTH wins; otherwise ask with a 1/2 menu, defaulting to
+    # the current keys' form (1 on a fresh install). Switching forms requires
+    # a clean slate.
+    if [[ -n $VLESS_AUTH_REQUESTED ]]; then
+      case "${VLESS_AUTH_REQUESTED,,}" in
+        x25519) VLESS_AUTH=x25519 ;;
+        mlkem768 | pq) VLESS_AUTH=mlkem768 ;;
+        *) die "VLESS_AUTH 只能是 x25519 或 mlkem768（也接受 pq）。" ;;
+      esac
+    else
+      read_value chosen_auth "认证形态（1=短链接 / 2=完整后量子，链接约1800字符）" "$([[ $existing_auth == mlkem768 ]] && printf 2 || printf 1)"
+      case "${chosen_auth,,}" in
+        '' | 1 | x25519) VLESS_AUTH=x25519 ;;
+        2 | mlkem768 | pq) VLESS_AUTH=mlkem768 ;;
+        *) die "认证形态只能选 1（短链接）或 2（完整后量子，链接约1800字符）。" ;;
+      esac
+    fi
+    if [[ -n $existing_auth && $VLESS_AUTH != "$existing_auth" ]]; then
+      die "现有密钥是 ${existing_auth} 认证，与所选的 ${VLESS_AUTH} 认证不一致，已停止以避免旧客户端失效。如需更换认证形态，请先卸载后重装。"
     fi
     if [[ $existing_mode == vless-xhttp-encryption && $VLESS_DECRYPTION != "$existing_decryption" ]]; then
       die "现有配置与 VLESS 密钥文件不匹配，已停止。"
     fi
+  elif [[ -n $VLESS_AUTH_REQUESTED ]]; then
+    case "${VLESS_AUTH_REQUESTED,,}" in
+      x25519 | mlkem768 | pq) ;;
+      *) die "VLESS_AUTH 只能是 x25519 或 mlkem768（也接受 pq）。" ;;
+    esac
   fi
 
   if [[ -z "$CUSTOM_UUID" ]]; then
@@ -818,22 +849,41 @@ install_xray() {
 }
 
 validate_vless_keys() {
-  # Use the short X25519 authentication pair from the pinned xray vlessenc.
-  # Its ephemeral key exchange also uses ML-KEM; this is not PQ authentication.
+  # The pinned xray vlessenc prints two authentication pairs; never mix them.
+  # 1) X25519 (not PQ): 43-char server and client keys. The ephemeral key
+  #    exchange still uses ML-KEM, so recorded traffic resists future decryption.
+  # 2) ML-KEM-768 (PQ): 86-char server seed and 1579-char client public key.
   [[ $VLESS_DECRYPTION =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]{43}$ ]] &&
-    [[ $VLESS_ENCRYPTION =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]{43}$ ]]
+    [[ $VLESS_ENCRYPTION =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]{43}$ ]] && return 0
+  [[ $VLESS_DECRYPTION =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]{86}$ ]] &&
+    [[ $VLESS_ENCRYPTION =~ ^mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]{1579}$ ]]
+}
+
+vless_keys_auth() {
+  [[ $VLESS_DECRYPTION =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]{43}$ ]] && { printf x25519; return 0; }
+  [[ $VLESS_DECRYPTION =~ ^mlkem768x25519plus\.native\.600s\.[A-Za-z0-9_-]{86}$ ]] && { printf mlkem768; return 0; }
+  return 1
 }
 
 prepare_vless_encryption() {
-  local generated
+  local generated group
   [[ $PROXY_MODE == vless-xhttp-encryption ]] || return 0
   if [[ $VLESS_DECRYPTION == none && $VLESS_ENCRYPTION == none ]]; then
+    # vlessenc prints the X25519 pair first, then the ML-KEM-768 pair.
+    case $VLESS_AUTH in
+      x25519) group=1 ;;
+      mlkem768) group=2 ;;
+      *) die "未知的 VLESS_AUTH=${VLESS_AUTH}。" ;;
+    esac
     generated=$("$SING_BOX_BIN" vlessenc) || die "生成 VLESS Encryption 密钥失败。"
-    VLESS_DECRYPTION=$(awk -F '"' '/^"decryption":/ { print $4; exit }' <<<"$generated")
-    VLESS_ENCRYPTION=$(awk -F '"' '/^"encryption":/ { print $4; exit }' <<<"$generated")
+    VLESS_DECRYPTION=$(awk -F '"' -v group="$group" '/^"decryption":/ { seen++; if (seen == group) { print $4; exit } }' <<<"$generated")
+    VLESS_ENCRYPTION=$(awk -F '"' -v group="$group" '/^"encryption":/ { seen++; if (seen == group) { print $4; exit } }' <<<"$generated")
     unset generated
   fi
   validate_vless_keys || die "Xray 返回的 VLESS Encryption 密钥格式不符合预期。"
+  if [[ $VLESS_AUTH == mlkem768 ]]; then
+    info "已启用 ML-KEM-768 抗量子认证：客户端链接约 1800 字符，导入时请确保完整复制。"
+  fi
 }
 
 render_core_configuration() {

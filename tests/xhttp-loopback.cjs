@@ -25,6 +25,7 @@ let uploadedBytes = 0;
 let binary;
 let link;
 let profile;
+let auth = '';
 let cleanupPromise;
 
 function hash(data) { return crypto.createHash('sha256').update(data).digest('hex'); }
@@ -189,7 +190,7 @@ async function checkMode(mode, originPort) {
     }
     client = await startClient(mode, originPort, 'valid-after-rejection');
     await transfer(client.port, `${mode}-recovery`);
-    console.log(`PASS real ${profile} ${mode}: exported link, concurrent 1 MiB downloads/upload, rejected UUID/path/Host/key, recovery`);
+    console.log(`PASS real ${profile}${auth ? `/${auth}` : ''} ${mode}: exported link, concurrent 1 MiB downloads/upload, rejected UUID/path/Host/key, recovery`);
   } catch (error) {
     console.error(`${mode} nginx: ${nginx.log}`);
     if (client) console.error(`${client.child.label}: ${client.child.log}`);
@@ -257,9 +258,11 @@ for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
     target.on('connection', socket => { targetSockets.add(socket); socket.once('close', () => targetSockets.delete(socket)); });
     target.listen(await freePort(), '127.0.0.1');
     await once(target, 'listening');
-    for (profile of ['vless-xhttp', 'vless-xhttp-encryption']) {
+    for ([profile, auth] of [['vless-xhttp', ''], ['vless-xhttp-encryption', 'x25519'],
+      ['vless-xhttp-encryption', 'mlkem768']]) {
       const corePort = await freePort(), originPort = await freePort();
-      await run('bash', [path.join(__dirname, 'prepare-vmess.sh'), root, String(corePort), String(originPort), profile]);
+      await run('bash', [path.join(__dirname, 'prepare-vmess.sh'), root, String(corePort), String(originPort), profile],
+        auth ? { env: { ...process.env, VLESS_AUTH: auth } } : {});
       await run(binary, ['run', '-test', '-config', path.join(root, 'config/config.json')]);
       link = new URL(fs.readFileSync(path.join(root, 'config/client.txt'), 'utf8').trim());
       assert.equal(link.protocol, 'vless:');
@@ -269,6 +272,10 @@ for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
       const server = JSON.parse(fs.readFileSync(path.join(root, 'config/config.json'), 'utf8')).inbounds[0];
       assert.equal(link.username, server.settings.clients[0].id);
       assert.equal(link.searchParams.get('path'), server.streamSettings.xhttpSettings.path);
+      if (auth === 'mlkem768') {
+        assert.equal(link.searchParams.get('encryption').split('.').at(-1).length, 1579, 'client ML-KEM-768 public key length');
+        assert.equal(server.settings.decryption.split('.').at(-1).length, 86, 'server ML-KEM-768 seed length');
+      }
       if (profile.endsWith('-encryption')) {
         assert.ok(!link.href.includes(server.settings.decryption.split('.').at(-1)), 'private key in share link');
         assert.equal(fs.statSync(path.join(root, 'config/vless-keys.json')).mode & 0o777, 0o600);
@@ -282,7 +289,7 @@ for (const [signal, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
       if (process.env.XRAY_TEST_DEBUG) config.log.loglevel = 'debug';
       fs.writeFileSync(configFile, JSON.stringify(config));
       await run(binary, ['run', '-test', '-config', configFile]);
-      const core = start(binary, ['run', '-config', path.join(root, 'config/config.json')], profile + ' server');
+      const core = start(binary, ['run', '-config', path.join(root, 'config/config.json')], profile + (auth ? `/${auth}` : '') + ' server');
       try {
         await waitPort(core, corePort);
         await checkMode('tunnel', originPort);

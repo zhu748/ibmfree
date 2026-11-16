@@ -900,6 +900,59 @@ test_vless_missing_or_mismatched_keys() {
   if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'mismatched keys accepted'; fi
 }
 
+test_vless_auth_forms_and_selection() {
+  local seed pubkey
+  seed=$(printf 'c%.0s' {1..86})
+  pubkey=$(printf 'd%.0s' {1..1579})
+  PROXY_MODE=vless-xhttp-encryption
+  collect_configuration </dev/null
+  VLESS_AUTH_REQUESTED=""
+  VLESS_AUTH=mlkem768
+  VLESS_DECRYPTION="mlkem768x25519plus.native.600s.$seed"
+  VLESS_ENCRYPTION="mlkem768x25519plus.native.0rtt.$pubkey"
+  render_core_configuration "$CONFIG_PATH"
+  printf '{"decryption":"%s","encryption":"%s"}\n' "$VLESS_DECRYPTION" "$VLESS_ENCRYPTION" >"$ENCRYPTION_PATH"
+  collect_configuration </dev/null
+  assert_equal "$(vless_keys_auth)" mlkem768
+  assert_equal "$VLESS_DECRYPTION" "mlkem768x25519plus.native.600s.$seed"
+  if (printf 'x25519\n' | collect_configuration) >"${TEST_ROOT}/error" 2>&1; then fail 'interactive mismatched form accepted'; fi
+  if (printf '1\n' | collect_configuration) >"${TEST_ROOT}/error" 2>&1; then fail 'interactive numeric-1 mismatched form accepted'; fi
+  collect_configuration <<< $'2\n'
+  assert_equal "$VLESS_AUTH" mlkem768
+  VLESS_AUTH_REQUESTED=x25519
+  VLESS_AUTH=x25519
+  if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'mismatched VLESS_AUTH rotated keys'; fi
+  VLESS_AUTH_REQUESTED=bogus
+  VLESS_AUTH=x25519
+  if (collect_configuration </dev/null) >"${TEST_ROOT}/error" 2>&1; then fail 'invalid VLESS_AUTH accepted'; fi
+  VLESS_AUTH_REQUESTED=""
+  VLESS_AUTH=x25519
+  VLESS_DECRYPTION=none
+  VLESS_ENCRYPTION=none
+  cat >"$SING_BOX_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf 'Authentication: X25519, not Post-Quantum\n'
+printf '"decryption": "mlkem768x25519plus.native.600s.%s"\n' "$(printf 'a%.0s' {1..43})"
+printf '"encryption": "mlkem768x25519plus.native.0rtt.%s"\n' "$(printf 'b%.0s' {1..43})"
+printf 'Authentication: ML-KEM-768, Post-Quantum\n'
+printf '"decryption": "mlkem768x25519plus.native.600s.%s"\n' "$(printf 'c%.0s' {1..86})"
+printf '"encryption": "mlkem768x25519plus.native.0rtt.%s"\n' "$(printf 'd%.0s' {1..1579})"
+EOF
+  chmod 0755 "$SING_BOX_BIN"
+  VLESS_AUTH_REQUESTED=mlkem768
+  VLESS_AUTH=mlkem768
+  prepare_vless_encryption
+  assert_equal "$VLESS_DECRYPTION" "mlkem768x25519plus.native.600s.$seed"
+  assert_equal "$VLESS_ENCRYPTION" "mlkem768x25519plus.native.0rtt.$pubkey"
+  VLESS_AUTH_REQUESTED=x25519
+  VLESS_AUTH=x25519
+  VLESS_DECRYPTION=none
+  VLESS_ENCRYPTION=none
+  prepare_vless_encryption
+  assert_equal "$(vless_keys_auth)" x25519
+  rm -f "$SING_BOX_BIN"
+}
+
 test_xray_checksum_failure() {
   download_file() { printf corrupt >"$2"; }
   if (install_xray) >"${TEST_ROOT}/error" 2>&1; then fail 'bad Xray checksum accepted'; fi
@@ -1552,6 +1605,7 @@ for test in test_first_install test_repeat_install test_explicit_values test_inv
   test_atomic_restore_signal test_rollback_restores_files \
   test_exit_rolls_back test_signal_rolls_back test_committed_exit_preserves_files test_render_config test_client_link test_vmess_fixture \
   test_profile_selection test_vless_reinstall_and_switch test_vless_missing_or_mismatched_keys \
+  test_vless_auth_forms_and_selection \
   test_xray_checksum_failure test_vless_output_contract test_xhttp_health_requires_core \
   test_management_bundle test_management_conflicts test_management_bundle_rollback test_management_list_private test_management_legacy_configuration \
   test_management_install_reuses_token test_management_service_scope test_management_menu_dispatch test_management_site \
